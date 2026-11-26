@@ -1129,7 +1129,10 @@ function Split-Linhas([string]$texto, [int]$larg) {
 function Write-Linhas([string]$texto, [string]$cor) {
     if ($script:Quieto) { return }
     if (-not $cor) { $cor = 'White' }
-    # Texto novo entra no lugar da barra; a barra volta embaixo na próxima atualização.
+    # Com barra na tela, etapa ("> ...") vira a linha dinâmica embaixo da barra
+    # em vez de ficar escrita; outro texto entra no lugar da barra, que volta
+    # embaixo na próxima atualização.
+    if ($script:ProgressoAtivo -and $texto.StartsWith('> ')) { Set-Progresso $script:UltPctTela $texto.Substring(2).TrimEnd('.') ; return }
     if ($script:BarraNaTela) { Clear-Barra }
     foreach ($l in (Split-Linhas $texto (Get-LarguraTexto))) { Write-Host ('  ' + $l) -ForegroundColor $cor }
 }
@@ -1433,12 +1436,16 @@ function Set-Progresso([int]$pct, [string]$msg) {
     if (-not $msg) { $msg = $script:Rotulo }
     if ($null -eq $script:BarraIni) { Reset-MedicaoBarra }
     $agora = [DateTime]::Now
+    $mudouEtapa = $false
     if ($msg -ne $script:UltMsgTela) {
         if ($script:UltMsgTela) { Write-Log ('BARRA_ETAPA_FIM "{0}" ms={1} barra={2}%' -f $script:UltMsgTela, [int]($agora - $script:EtapaIni).TotalMilliseconds, $script:UltPctTela) }
         $script:EtapaIni = $agora
-        Clear-Barra; Write-Linhas ('> ' + $msg) 'Cyan'; $script:UltMsgTela = $msg
+        # A etapa só aparece na linha embaixo da barra, trocada no lugar (não
+        # fica uma linha "> etapa" para cada passo na tela).
+        $script:UltMsgTela = $msg
+        $mudouEtapa = $true
     }
-    if ($pct -ne $script:UltPctTela -or -not $script:BarraNaTela) {
+    if ($mudouEtapa -or $pct -ne $script:UltPctTela -or -not $script:BarraNaTela) {
         if ($pct -ne $script:UltPctTela) {
             $parada = ($agora - $script:BarraUltMud).TotalMilliseconds
             if ($parada -gt $script:BarraMaxParada) { $script:BarraMaxParada = $parada; $script:BarraParadaEm = '{0}% "{1}"' -f $script:UltPctTela, $msg }
