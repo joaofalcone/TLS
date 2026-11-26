@@ -3041,8 +3041,27 @@ function Invoke-Automatico {
             try {
                 Set-Progresso 78 'Mudando para GSurf'
                 Switch-Gsurf
-                $script:Rotulo = 'Testando a comunicação'
-                $r = Invoke-TesteSiTef 'GSURF' 82 98
+                # Certificado recém-instalado: o serviço GSurf relê o certificado ao
+                # reiniciar, e a conexão leva alguns segundos para subir. Testar na
+                # hora dava falha, e o teste pelo menu minutos depois passava.
+                Set-Progresso 80 'Reiniciando o serviço GSurf'
+                $svc = Get-ServicoGsurf
+                if ($svc) { try { Restart-Service -Name $svc.Name -Force -ErrorAction Stop } catch { Write-Log ('WARN: restart {0}: {1}' -f $svc.Name, (Get-MsgErro $_)) } }
+                $faixas = @(@(82, 89), @(90, 94), @(95, 98))
+                for ($t = 1; $t -le 3; $t++) {
+                    if ($t -gt 1) {
+                        Write-Log ('GSURF_RETESTE: tentativa {0}/3 (falha anterior: {1})' -f $t, $r.Util)
+                        $fimEspera = [DateTime]::Now.AddSeconds(15)
+                        while ([DateTime]::Now -lt $fimEspera) {
+                            Set-Progresso $faixas[$t - 1][0] ('Aguardando a GSurf conectar (tentativa {0} de 3)' -f $t)
+                            Start-Sleep -Milliseconds 500
+                        }
+                    }
+                    $script:Rotulo = 'Testando a comunicação'
+                    if ($t -gt 1) { $script:Rotulo = 'Testando a comunicação (tentativa {0} de 3)' -f $t }
+                    $r = Invoke-TesteSiTef 'GSURF' $faixas[$t - 1][0] $faixas[$t - 1][1]
+                    if ($r.Codigo -eq 0) { break }
+                }
                 if ($r.Codigo -eq 0) { $gsurfTesteOk = $true }
                 else {
                     $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
