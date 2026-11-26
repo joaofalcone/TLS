@@ -2939,11 +2939,12 @@ function Start-Fase([string]$nome) {
     Write-Host ('  ' + $nome) -ForegroundColor White
 }
 
-function Stop-Fase([bool]$ok) {
+function Stop-Fase([bool]$ok, [string]$sucesso) {
     if (-not $script:ProgressoAtivo) { return }
     if ($ok) { Write-Barra 100 'Concluído' }
     else { Write-Barra $script:UltPctTela 'Falhou (detalhes abaixo)' }
     Close-Progresso
+    if ($ok -and $sucesso) { Write-Host ('  [ OK ] ' + $sucesso) -ForegroundColor Green }
 }
 
 # +--------------------------------------------------------------------------+
@@ -2995,7 +2996,7 @@ function Invoke-Automatico {
         Invoke-Rollback
         $falhas += ,@(('TLS - instalação: ' + $e), 'A configuração TLS anterior foi restaurada.')
     }
-    Stop-Fase $tlsOk
+    Stop-Fase $tlsOk 'TLS instalado e comunicando com sucesso.'
 
     # 2) GSurf (outra barra, 0 a 100%): só com sinal verde do TLS. Arquivos,
     #    requisitos e serviço; o OTP é pedido logo antes do certificado (vence
@@ -3051,7 +3052,7 @@ function Invoke-Automatico {
         }
         # GSurf não comunicou: volta para o TLS, que passou no teste.
         if (-not $gsurfTesteOk) { try { Mount-Tls } catch { } }
-        Stop-Fase $gsurfTesteOk
+        Stop-Fase $gsurfTesteOk 'GSurf instalado e comunicando com sucesso.'
     }
     $credAberta = $null
     $script:CredAberta = $null
