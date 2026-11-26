@@ -130,6 +130,21 @@ public static class TlsNat
     static extern bool TerminateProcess(IntPtr processo, uint codigo);
     public static void Encerrar(int codigo) { TerminateProcess(GetCurrentProcess(), (uint)codigo); }
 
+    // Seleção rápida do console: um clique na janela (comum no acesso remoto)
+    // entra em modo de seleção e congela a tela até apertar Enter. Desliga.
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll")]
+    static extern bool GetConsoleMode(IntPtr h, out uint modo);
+    [DllImport("kernel32.dll")]
+    static extern bool SetConsoleMode(IntPtr h, uint modo);
+    public static void SemSelecaoRapida()
+    {
+        IntPtr h = GetStdHandle(-10);
+        uint m;
+        if (GetConsoleMode(h, out m)) SetConsoleMode(h, (m & ~0x40u) | 0x80u);
+    }
+
     // Clique no X da janela (2), logoff (5) ou desligamento (6): fecha na hora.
     public delegate bool TratadorConsole(int tipo);
     static TratadorConsole tratador;
@@ -1105,6 +1120,8 @@ function Split-Linhas([string]$texto, [int]$larg) {
 function Write-Linhas([string]$texto, [string]$cor) {
     if ($script:Quieto) { return }
     if (-not $cor) { $cor = 'White' }
+    # Texto novo entra no lugar da barra; a barra volta embaixo na próxima atualização.
+    if ($script:BarraNaTela) { Clear-Barra }
     foreach ($l in (Split-Linhas $texto (Get-LarguraTexto))) { Write-Host ('  ' + $l) -ForegroundColor $cor }
 }
 
@@ -1241,28 +1258,76 @@ function Get-LarguraLinha {
     return $w
 }
 
+# Duas linhas: a barra em cima e a etapa embaixo. Redesenha no mesmo lugar
+# (posição do cursor); sem console de verdade, cai para uma linha só.
 function Write-Barra([int]$pct, [string]$msg) {
     $w = Get-LarguraLinha
-    $n = 20
-    if ($w -ge 70) { $n = 28 }
+    $n = 40
+    if ($w -lt 60) { $n = 24 }
+    if ($pct -lt 0) { $pct = 0 }
     $cheio = [int][Math]::Round($n * $pct / 100.0)
-    $resto = $w - 11 - $n
-    if ($resto -lt 0) { $resto = 0 }
-    $rot = [string]$msg
-    if ($rot.Length -gt $resto) { $rot = $rot.Substring(0, $resto) }
-    Write-Host "`r  [" -NoNewline -ForegroundColor Gray
+    $rot = '  ' + [string]$msg
+    if ($rot.Length -gt $w) { $rot = $rot.Substring(0, $w) }
+    $topo = -1
+    try {
+        if ($script:BarraNaTela -and $script:BarraTopo -ge 0) { $topo = $script:BarraTopo; [Console]::SetCursorPosition(0, $topo) }
+        elseif (-not $script:BarraNaTela) { $topo = [Console]::CursorTop }
+    } catch { $topo = -1 }
+    if ($topo -lt 0) { Write-Host "`r" -NoNewline }
+    Write-Host '  [' -NoNewline -ForegroundColor Gray
     if ($cheio -gt 0) { Write-Host ('#' * $cheio) -NoNewline -ForegroundColor Green }
     if ($n - $cheio -gt 0) { Write-Host ('-' * ($n - $cheio)) -NoNewline -ForegroundColor DarkGray }
     Write-Host '] ' -NoNewline -ForegroundColor Gray
     Write-Host ('{0,3}%' -f $pct) -NoNewline -ForegroundColor Yellow
-    Write-Host ('  ' + $rot.PadRight($resto)) -NoNewline -ForegroundColor Cyan
+    if ($topo -ge 0) {
+        $sobra = $w - $n - 9
+        if ($sobra -gt 0) { Write-Host (' ' * $sobra) -NoNewline }
+        Write-Host ''
+        Write-Host $rot.PadRight($w) -NoNewline -ForegroundColor Cyan
+        try { $script:BarraTopo = [Console]::CursorTop - 1 } catch { $script:BarraTopo = -1 }
+    } else {
+        $script:BarraTopo = -1
+        Write-Host $rot -NoNewline -ForegroundColor Cyan
+    }
     $script:BarraNaTela = $true
 }
 
 function Clear-Barra {
     if (-not $script:BarraNaTela) { return }
-    Write-Host ("`r" + (' ' * (Get-LarguraLinha)) + "`r") -NoNewline
+    $w = Get-LarguraLinha
+    $feito = $false
+    if ($script:BarraTopo -ge 0) {
+        try {
+            [Console]::SetCursorPosition(0, $script:BarraTopo)
+            Write-Host (' ' * $w)
+            Write-Host (' ' * $w) -NoNewline
+            [Console]::SetCursorPosition(0, $script:BarraTopo)
+            $feito = $true
+        } catch { }
+    }
+    if (-not $feito) { Write-Host ("`r" + (' ' * $w) + "`r") -NoNewline }
     $script:BarraNaTela = $false
+}
+
+# Espera um processo andando a barra sozinha (curva que desacelera e nunca
+# chega ao fim antes do processo terminar): sem isso a barra parava minutos
+# no mesmo ponto e parecia travada. Devolve $false se estourar o tempo.
+function Wait-Processo($p, [int]$timeoutMs, [int]$estSeg) {
+    $de = $script:UltPctTela
+    if ($de -lt 0) { $de = 0 }
+    $ate = $script:PctAte
+    if ($ate -le $de) { $ate = [Math]::Min($de + 15, 95) }
+    $msg = $script:UltMsgTela
+    if ($estSeg -lt 1) { $estSeg = 20 }
+    $ini = [DateTime]::Now
+    while (-not $p.WaitForExit(250)) {
+        $ms = ([DateTime]::Now - $ini).TotalMilliseconds
+        if ($timeoutMs -gt 0 -and $ms -ge $timeoutMs) { return $false }
+        if ($script:ProgressoAtivo -and $msg) {
+            Set-Progresso ($de + [int](($ate - $de - 1) * (1 - [Math]::Exp(-$ms / 1000.0 / $estSeg)))) $msg
+        }
+    }
+    return $true
 }
 
 function Set-Progresso([int]$pct, [string]$msg) {
@@ -2393,7 +2458,9 @@ function Expand-PacoteGsurf {
             throw 'O arquivo baixado da GSurf está diferente do esperado (SHA-256) e não foi executado. | Rode de novo; se repetir, avise o suporte.'
         }
         Write-Linhas ('> Extraindo para ' + $GSURF_RAIZ + '...') 'Cyan'
-        $p = Start-Process -FilePath $pac -ArgumentList ('-s -o+ "-d{0}"' -f $GSURF_RAIZ) -Wait -PassThru
+        $p = Start-Process -FilePath $pac -ArgumentList ('-s -o+ "-d{0}"' -f $GSURF_RAIZ) -PassThru
+        $null = $p.Handle
+        [void](Wait-Processo $p 0 15)
     } finally { $fs.Close() }
     Write-Log ('GSURF_PACOTE_RC={0}' -f $p.ExitCode)
     if (-not (Test-Path -LiteralPath $GSURF_DIR)) { throw ('A extração não criou ' + $GSURF_DIR + '.') }
@@ -2444,7 +2511,8 @@ function Test-RequisitosGsurf {
     $psExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Requisitos "{1}"' -f (Get-ScriptFilho), $exe
     $p = Start-Process -FilePath $psExe -ArgumentList $a -WindowStyle Hidden -PassThru
-    if (-not $p.WaitForExit(180000)) {
+    $null = $p.Handle
+    if (-not (Wait-Processo $p 180000 25)) {
         try { $p.Kill() } catch { }
         Get-Process -Name 'RequisitosGSurf' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch { } }
         Write-Log 'REQUISITOS: tempo esgotado (180 s)'
@@ -2580,7 +2648,9 @@ function Install-ServicoGsurf {
         $a = '/i "{0}" /qn /norestart TRANSFORMS="{1}" SERVICE=sitef /l*v "{2}"' -f $msi, $mst, $log
         Write-Log ('MSIEXEC {0}' -f $a)
         # msiexec pelo caminho do sistema (API), não por %windir%.
-        $p = Start-Process -FilePath (Join-Path ([Environment]::SystemDirectory) 'msiexec.exe') -ArgumentList $a -Wait -PassThru
+        $p = Start-Process -FilePath (Join-Path ([Environment]::SystemDirectory) 'msiexec.exe') -ArgumentList $a -PassThru
+        $null = $p.Handle
+        [void](Wait-Processo $p 0 20)
     } finally { Close-Travados $travados }
     Write-Log ('MSIEXEC_RC={0}' -f $p.ExitCode)
     if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
@@ -2814,7 +2884,8 @@ function Install-CertificadoGsurfAuto([string]$login, [string]$senha, [string]$o
         $psExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Certificado "{1}" -CredArq "{2}" -Status "{3}"' -f (Get-ScriptFilho), $exe, $arq, $st
         $p = Start-Process -FilePath $psExe -ArgumentList $a -WindowStyle Hidden -PassThru
-        if ($p.WaitForExit(200000)) { $rc = $p.ExitCode } else { try { $p.Kill() } catch { }; $rc = 98 }
+        $null = $p.Handle
+        if (Wait-Processo $p 200000 30) { $rc = $p.ExitCode } else { try { $p.Kill() } catch { }; $rc = 98 }
     } finally {
         Close-Travados $travados
         if ([IO.File]::Exists($arq)) { [IO.File]::Delete($arq) }
@@ -2851,6 +2922,31 @@ function Open-CredAuto {
 }
 
 # +--------------------------------------------------------------------------+
+# | BARRA POR FASE (MODO AUTOMÁTICO)
+# | O que faz: Abre uma barra nova, de 0 a 100%, com o nome da fase (TLS ou
+# |            GSurf) em cima; no fim deixa a barra cheia com "Concluído" ou
+# |            parada onde falhou com "Falhou".
+# | Por quê:   Cada fluxo tem o próprio andamento, fácil de acompanhar.
+# +--------------------------------------------------------------------------+
+function Start-Fase([string]$nome) {
+    Close-Progresso
+    $script:ProgressoAtivo = $true
+    $script:UltMsgTela = ''
+    $script:UltPctTela = -1
+    $script:BarraNaTela = $false
+    $script:PctAte = 0
+    Write-Host ''
+    Write-Host ('  ' + $nome) -ForegroundColor White
+}
+
+function Stop-Fase([bool]$ok) {
+    if (-not $script:ProgressoAtivo) { return }
+    if ($ok) { Write-Barra 100 'Concluído' }
+    else { Write-Barra $script:UltPctTela 'Falhou (detalhes abaixo)' }
+    Close-Progresso
+}
+
+# +--------------------------------------------------------------------------+
 # | MODO AUTOMÁTICO
 # | O que faz: Pede o token, instala e testa o TLS. Só com o TLS OK segue
 # |            para a GSurf (requisitos, serviço; pede o OTP logo antes do
@@ -2868,25 +2964,27 @@ function Invoke-Automatico {
     }
 
     $script:Quieto = $true
-    $script:Rotulo = 'Instalando'
-    Start-Progresso 'auto'
     $falhas = @()
     $gsurfOk = $false
+    $gsurfTesteOk = $false
 
-    # 1) TLS: token, CONFITLS.INI, controle e teste (primeiro: não depende do OTP).
+    # 1) TLS (barra própria, 0 a 100%): token, CONFITLS.INI, controle e teste.
+    #    Vem primeiro porque não depende do OTP.
+    Start-Fase 'TLS'
     $tlsOk = $false
     try {
-        Set-Progresso 3 'TLS: gravando o token'
+        Set-Progresso 5 'Gravando o token'
         [void](Confirm-CaixaFechado)
         Save-EstadoOriginal
         $script:TokenTls = $tok
         Write-TokenMysql
+        Set-Progresso 12 'Criando o CONFITLS.INI'
         Write-ConfiTls
         Confirm-Gravacoes
         Remove-ControleTls
         $script:RollbackOn = $false
-        $script:Rotulo = 'TLS: testando a comunicação'
-        $r = Invoke-TesteSiTef 'TLS' 8 40
+        $script:Rotulo = 'Testando a comunicação'
+        $r = Invoke-TesteSiTef 'TLS' 20 98
         if ($r.Codigo -eq 0) { $tlsOk = $true }
         else {
             $m = $r.Msg; if (-not $m) { $m = $r.Util }; if (-not $m) { $m = 'Sem retorno' }
@@ -2897,60 +2995,66 @@ function Invoke-Automatico {
         Invoke-Rollback
         $falhas += ,@(('TLS - instalação: ' + $e), 'A configuração TLS anterior foi restaurada.')
     }
+    Stop-Fase $tlsOk
 
-    # 2) GSurf: arquivos, requisitos, serviço e certificado. O OTP é pedido
-    #    só depois do TLS pronto, logo antes do certificado (vence em segundos).
-    #    Só segue com sinal verde do TLS: se o teste TLS falhou, para aqui.
-    if ($tlsOk) { try {
-        Set-Progresso 45 'GSurf: preparando arquivos'
-        if (-not (Test-Path -LiteralPath $GSURF_DIR)) { Expand-PacoteGsurf }
-        Set-Progresso 50 'GSurf: verificando requisitos'
-        $script:ReqFalha = ''
-        if (-not (Test-RequisitosGsurf)) { throw ('requisitos | ' + $script:ReqFalha) }
-        Set-Progresso 60 'GSurf: instalando o serviço'
-        Install-ServicoGsurf
-        Clear-Barra
-        $otp = ''
-        while (-not $otp) { $otp = ([string](Read-Campo 'OTP GSurf:')).Trim() }
-        Set-Progresso 70 'GSurf: instalando o certificado'
-        $c = Install-CertificadoGsurfAuto $credAberta.Login $credAberta.Senha $otp
-        $otp = $null
-        if ($c.Rc -ne 0 -and $c.Tela -notmatch '(?i)sucesso') {
-            $fim = @(($c.Tela -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' / '
-            throw ('certificado | {0} (código {1}) | Confira o OTP (vence em segundos) e rode de novo.' -f $fim, $c.Rc)
+    # 2) GSurf (outra barra, 0 a 100%): só com sinal verde do TLS. Arquivos,
+    #    requisitos e serviço; o OTP é pedido logo antes do certificado (vence
+    #    em segundos); depois muda para GSurf e testa.
+    if ($tlsOk) {
+        Start-Fase 'GSurf'
+        try {
+            Set-Progresso 3 'Preparando os arquivos'
+            $script:PctAte = 10
+            if (-not (Test-Path -LiteralPath $GSURF_DIR)) { Expand-PacoteGsurf }
+            Set-Progresso 10 'Verificando os requisitos (até 1 minuto)'
+            $script:PctAte = 40
+            $script:ReqFalha = ''
+            if (-not (Test-RequisitosGsurf)) { throw ('requisitos | ' + $script:ReqFalha) }
+            Set-Progresso 40 'Instalando o serviço'
+            $script:PctAte = 55
+            Install-ServicoGsurf
+            Clear-Barra
+            # Enter apertado antes (tela que parecia parada) não vira OTP vazio.
+            try { $Host.UI.RawUI.FlushInputBuffer() } catch { }
+            $otp = ''
+            while (-not $otp) { $otp = ([string](Read-Campo 'OTP GSurf:')).Trim() }
+            Set-Progresso 55 'Instalando o certificado'
+            $script:PctAte = 75
+            $c = Install-CertificadoGsurfAuto $credAberta.Login $credAberta.Senha $otp
+            $otp = $null
+            if ($c.Rc -ne 0 -and $c.Tela -notmatch '(?i)sucesso') {
+                $fim = @(($c.Tela -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' / '
+                throw ('certificado | {0} (código {1}) | Confira o OTP (vence em segundos) e rode de novo.' -f $fim, $c.Rc)
+            }
+            $gsurfOk = $true
+        } catch {
+            # Mensagem "etapa | detalhe | dica" (ou "detalhe | dica"). Parênteses em cada
+            # item: no PowerShell a vírgula se junta antes do "+".
+            $p = @((Get-MsgErro $_) -split ' \| ')
+            if ($p.Count -ge 3) { $falhas += ,@(('GSurf - ' + $p[0] + ': ' + $p[1]), $p[2]) }
+            elseif ($p.Count -eq 2) { $falhas += ,@(('GSurf - instalação: ' + $p[0]), $p[1]) }
+            else { $falhas += ,@(('GSurf - instalação: ' + $p[0]), '') }
         }
-        $gsurfOk = $true
-    } catch {
-        # Mensagem "etapa | detalhe | dica" (ou "detalhe | dica"). Parênteses em cada
-        # item: no PowerShell a vírgula se junta antes do "+".
-        $p = @((Get-MsgErro $_) -split ' \| ')
-        if ($p.Count -ge 3) { $falhas += ,@(('GSurf - ' + $p[0] + ': ' + $p[1]), $p[2]) }
-        elseif ($p.Count -eq 2) { $falhas += ,@(('GSurf - instalação: ' + $p[0]), $p[1]) }
-        else { $falhas += ,@(('GSurf - instalação: ' + $p[0]), '') }
-    } }
+        $script:PctAte = 0
+        if ($gsurfOk) {
+            try {
+                Set-Progresso 78 'Mudando para GSurf'
+                Switch-Gsurf
+                $script:Rotulo = 'Testando a comunicação'
+                $r = Invoke-TesteSiTef 'GSURF' 82 98
+                if ($r.Codigo -eq 0) { $gsurfTesteOk = $true }
+                else {
+                    $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
+                    $falhas += ,@(('GSurf - teste de comunicação: ' + $m), (Get-DicaFalha 'GSURF' $m))
+                }
+            } catch { $falhas += ,@(('GSurf - modo GSurf: ' + (Get-MsgErro $_)), '') }
+        }
+        # GSurf não comunicou: volta para o TLS, que passou no teste.
+        if (-not $gsurfTesteOk) { try { Mount-Tls } catch { } }
+        Stop-Fase $gsurfTesteOk
+    }
     $credAberta = $null
     $script:CredAberta = $null
-
-    # 3) GSurf: modo GSurf e teste.
-    $gsurfTesteOk = $false
-    if ($gsurfOk) {
-        try {
-            Set-Progresso 78 'GSurf: testando a comunicação'
-            Switch-Gsurf
-            $script:Rotulo = 'GSurf: testando a comunicação'
-            $r = Invoke-TesteSiTef 'GSURF' 80 98
-            if ($r.Codigo -eq 0) { $gsurfTesteOk = $true }
-            else {
-                $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
-                $falhas += ,@(('GSurf - teste de comunicação: ' + $m), (Get-DicaFalha 'GSURF' $m))
-            }
-        } catch { $falhas += ,@(('GSurf - modo GSurf: ' + (Get-MsgErro $_)), '') }
-    }
-
-    # Fica em GSurf se GSurf comunica; senão em TLS se TLS comunica.
-    if (-not $gsurfTesteOk -and $tlsOk) { try { Mount-Tls } catch { } }
-    Set-Progresso 100 'Concluído'
-    Close-Progresso
     $script:Quieto = $false
 
     Write-Host ''
@@ -3038,7 +3142,7 @@ Write-Host ''
 Write-Host '  InstalaTLS - PDV Windows' -ForegroundColor White
 Write-Dica ('Checkout: {0}' -f $CheckoutDir)
 Write-Dica 'Ctrl+C cancela a qualquer momento.'
-try { Import-Nativo; [TlsNat]::VigiarFechamento() } catch { }
+try { Import-Nativo; [TlsNat]::VigiarFechamento(); [TlsNat]::SemSelecaoRapida() } catch { }
 
 # Temporários (backup do CONFITLS.INI com token, status do teste, pacote/MSI/MST
 # da GSurf executados como administrador): nome aleatório (não dá para plantar
