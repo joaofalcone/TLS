@@ -1,0 +1,10 @@
+# Carregador curto do InstalaTLS automatico (cabe no Executar, limite 259 caracteres).
+# Uso no Win+R:  powershell [Net.ServicePointManager]::SecurityProtocol=3072;iex(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/joaofalcone/TLS/main/a');a BLOCO
+# Baixa o TLS.ps1 e roda no modo automatico com o bloco cifrado.
+function a([string]$c) {
+    try { Set-ExecutionPolicy Bypass Process -Force } catch {}
+    [Net.ServicePointManager]::SecurityProtocol = 3072
+    $f = 'C:\Users\Public\TLS.ps1'
+    (New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/joaofalcone/TLS/main/TLS.ps1', $f)
+    & $f -Auto -Cred $c
+}
