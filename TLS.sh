@@ -3245,9 +3245,9 @@ instalar_gsurf_auto(){
 
 # +--------------------------------------------------------------------------+
 # | MODO AUTOMÁTICO
-# | O que faz: Pede PIN, token e OTP; instala GSurf (instalador + serviço),
-# |            instala TLS, testa os dois e deixa em GSurf. Mostra só OK ou
-# |            ERRO com o local e a dica.
+# | O que faz: Pede o token, instala e testa o TLS. Só com o TLS OK pede o
+# |            OTP, instala a GSurf (instalador + serviço), testa e deixa em
+# |            GSurf. Mostra só OK ou ERRO com o local e a dica.
 # | Por quê:   Instalação completa em uma tacada, sem menus.
 # +--------------------------------------------------------------------------+
 modo_auto(){
@@ -3279,24 +3279,13 @@ modo_auto(){
     if [[ "$tok" =~ ^[0-9]{4}(-[0-9]{4}){3}$ ]]; then break; fi
     ui_erro "Token inválido."
   done
-  while [[ -z "$otp" ]]; do
-    ui_out '  %sOTP GSurf:%s ' "$C_PER" "$C_RST"
-    otp="$(ler | tr -d '[:space:]')"
-  done
 
   UI_OK=1; UI_PCT=0; LAST_UI_LOOP_PCT=""
-  # 1) GSurf: instalador (login, senha e OTP) e serviço.
-  ui_progress 5 "GSurf: instalando"
-  if erro="$(instalar_gsurf_auto "$login" "$senha" "$otp")"; then gsurf=1
-  else falhas+=("GSurf - instalação: ${erro}|Confira o OTP (vence em segundos), login/senha da GSurf e o serviço ${GSURF_SERVICO}.")
-  fi
-  login=""; senha=""; otp=""
-
-  # 2) TLS: chave, token, CONFITLS.INI, serviço e teste.
+  # 1) TLS: chave, token, CONFITLS.INI, serviço e teste (primeiro: não depende do OTP).
   nova_acao "auto_tls"
   TOKEN_TLS="$tok"
   UI_TEST_LABEL="TLS: testando a comunicação"
-  ui_progress 30 "TLS: gravando o token"
+  ui_progress 5 "TLS: gravando o token"
   erro=""
   ui_step_min "Capturando estado original" capture_original_state || erro="capturar o estado original"
   [[ -n "$erro" ]] || ui_step_min "Ajustando modo TLS" step_set_flag_tls || erro="ajustar o modo TLS"
@@ -3308,15 +3297,30 @@ modo_auto(){
     falhas+=("TLS - instalação: falha ao ${erro}|A configuração TLS anterior foi restaurada.")
   else
     ROLLBACK_ENABLED=0
-    if ui_step_min "TLS: testando a comunicação" run_integrated_tls_test 40; then okT=1
+    if ui_step_min "TLS: testando a comunicação" run_integrated_tls_test 10; then okT=1
     else falhas+=("TLS - teste de comunicação: ${TEST_RESULT_MSG:-Sem retorno}|$(dica_falha TLS "${TEST_RESULT_MSG:-}")")
     fi
   fi
 
+  # 2) GSurf: só com sinal verde do TLS. O OTP é pedido agora, logo antes do
+  #    instalador (vence em segundos).
+  if (( okT == 1 )); then
+    ui_out '\n'
+    while [[ -z "$otp" ]]; do
+      ui_out '  %sOTP GSurf:%s ' "$C_PER" "$C_RST"
+      otp="$(ler | tr -d '[:space:]')"
+    done
+    ui_progress 50 "GSurf: instalando"
+    if erro="$(instalar_gsurf_auto "$login" "$senha" "$otp")"; then gsurf=1
+    else falhas+=("GSurf - instalação: ${erro}|Confira o OTP (vence em segundos), login/senha da GSurf e o serviço ${GSURF_SERVICO}.")
+    fi
+  fi
+  login=""; senha=""; otp=""
+
   # 3) GSurf: modo GSurf e teste.
   if (( gsurf == 1 )); then
     UI_TEST_LABEL="GSurf: testando a comunicação"
-    ui_progress 70 "GSurf: testando a comunicação"
+    ui_progress 75 "GSurf: testando a comunicação"
     if ui_step_min "Montando ambiente GSurf" step_switch_to_gsurf; then
       ui_step_min "GSurf: testando a comunicação" step_validate_final_mode GSURF || true
       if [[ "${FINAL_MODE_TEST_OK:-0}" == "1" ]]; then okG=1
@@ -3342,6 +3346,7 @@ modo_auto(){
       if [[ -n "${f#*|}" ]]; then ui_aviso "${f#*|}"; fi
       log "AUTO_FALHA: ${f}"
     done
+    if (( okT == 0 )); then ui_aviso "GSurf não foi instalado: só segue com o TLS testado OK."; fi
     ui_out '  PDV em modo %s.\n' "$(nome_modo "$(modo_atual)")"
   fi
   ui_dica "Log: ${FINAL_LOG_FILE}"

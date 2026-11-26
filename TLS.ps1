@@ -2852,9 +2852,9 @@ function Open-CredAuto {
 
 # +--------------------------------------------------------------------------+
 # | MODO AUTOMÁTICO
-# | O que faz: Pede PIN e token, instala GSurf (requisitos, serviço e
-# |            certificado; pede o OTP na hora do certificado para não
-# |            vencer), instala TLS, testa os dois e deixa em GSurf. Mostra só
+# | O que faz: Pede o token, instala e testa o TLS. Só com o TLS OK segue
+# |            para a GSurf (requisitos, serviço; pede o OTP logo antes do
+# |            certificado para não vencer), testa e deixa em GSurf. Mostra só
 # |            OK ou ERRO com o local e a dica.
 # | Por quê:   Instalação completa em uma tacada, sem menus.
 # +--------------------------------------------------------------------------+
@@ -2873,19 +2873,46 @@ function Invoke-Automatico {
     $falhas = @()
     $gsurfOk = $false
 
-    # 1) GSurf: arquivos, requisitos, serviço e certificado.
+    # 1) TLS: token, CONFITLS.INI, controle e teste (primeiro: não depende do OTP).
+    $tlsOk = $false
     try {
-        Set-Progresso 3 'GSurf: preparando arquivos'
+        Set-Progresso 3 'TLS: gravando o token'
+        [void](Confirm-CaixaFechado)
+        Save-EstadoOriginal
+        $script:TokenTls = $tok
+        Write-TokenMysql
+        Write-ConfiTls
+        Confirm-Gravacoes
+        Remove-ControleTls
+        $script:RollbackOn = $false
+        $script:Rotulo = 'TLS: testando a comunicação'
+        $r = Invoke-TesteSiTef 'TLS' 8 40
+        if ($r.Codigo -eq 0) { $tlsOk = $true }
+        else {
+            $m = $r.Msg; if (-not $m) { $m = $r.Util }; if (-not $m) { $m = 'Sem retorno' }
+            $falhas += ,@(('TLS - teste de comunicação: ' + $m), (Get-DicaFalha 'TLS' $m))
+        }
+    } catch {
+        $e = Get-MsgErro $_
+        Invoke-Rollback
+        $falhas += ,@(('TLS - instalação: ' + $e), 'A configuração TLS anterior foi restaurada.')
+    }
+
+    # 2) GSurf: arquivos, requisitos, serviço e certificado. O OTP é pedido
+    #    só depois do TLS pronto, logo antes do certificado (vence em segundos).
+    #    Só segue com sinal verde do TLS: se o teste TLS falhou, para aqui.
+    if ($tlsOk) { try {
+        Set-Progresso 45 'GSurf: preparando arquivos'
         if (-not (Test-Path -LiteralPath $GSURF_DIR)) { Expand-PacoteGsurf }
-        Set-Progresso 8 'GSurf: verificando requisitos'
+        Set-Progresso 50 'GSurf: verificando requisitos'
         $script:ReqFalha = ''
         if (-not (Test-RequisitosGsurf)) { throw ('requisitos | ' + $script:ReqFalha) }
-        Set-Progresso 20 'GSurf: instalando o serviço'
+        Set-Progresso 60 'GSurf: instalando o serviço'
         Install-ServicoGsurf
         Clear-Barra
         $otp = ''
         while (-not $otp) { $otp = ([string](Read-Campo 'OTP GSurf:')).Trim() }
-        Set-Progresso 30 'GSurf: instalando o certificado'
+        Set-Progresso 70 'GSurf: instalando o certificado'
         $c = Install-CertificadoGsurfAuto $credAberta.Login $credAberta.Senha $otp
         $otp = $null
         if ($c.Rc -ne 0 -and $c.Tela -notmatch '(?i)sucesso') {
@@ -2900,43 +2927,18 @@ function Invoke-Automatico {
         if ($p.Count -ge 3) { $falhas += ,@(('GSurf - ' + $p[0] + ': ' + $p[1]), $p[2]) }
         elseif ($p.Count -eq 2) { $falhas += ,@(('GSurf - instalação: ' + $p[0]), $p[1]) }
         else { $falhas += ,@(('GSurf - instalação: ' + $p[0]), '') }
-    }
+    } }
     $credAberta = $null
     $script:CredAberta = $null
-
-    # 2) TLS: token, CONFITLS.INI, controle e teste.
-    $tlsOk = $false
-    try {
-        Set-Progresso 45 'TLS: gravando o token'
-        [void](Confirm-CaixaFechado)
-        Save-EstadoOriginal
-        $script:TokenTls = $tok
-        Write-TokenMysql
-        Write-ConfiTls
-        Confirm-Gravacoes
-        Remove-ControleTls
-        $script:RollbackOn = $false
-        $script:Rotulo = 'TLS: testando a comunicação'
-        $r = Invoke-TesteSiTef 'TLS' 50 70
-        if ($r.Codigo -eq 0) { $tlsOk = $true }
-        else {
-            $m = $r.Msg; if (-not $m) { $m = $r.Util }; if (-not $m) { $m = 'Sem retorno' }
-            $falhas += ,@(('TLS - teste de comunicação: ' + $m), (Get-DicaFalha 'TLS' $m))
-        }
-    } catch {
-        $e = Get-MsgErro $_
-        Invoke-Rollback
-        $falhas += ,@(('TLS - instalação: ' + $e), 'A configuração TLS anterior foi restaurada.')
-    }
 
     # 3) GSurf: modo GSurf e teste.
     $gsurfTesteOk = $false
     if ($gsurfOk) {
         try {
-            Set-Progresso 75 'GSurf: testando a comunicação'
+            Set-Progresso 78 'GSurf: testando a comunicação'
             Switch-Gsurf
             $script:Rotulo = 'GSurf: testando a comunicação'
-            $r = Invoke-TesteSiTef 'GSURF' 78 98
+            $r = Invoke-TesteSiTef 'GSURF' 80 98
             if ($r.Codigo -eq 0) { $gsurfTesteOk = $true }
             else {
                 $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
@@ -2959,6 +2961,7 @@ function Invoke-Automatico {
             Write-Host ('  ERRO em ' + $f[0]) -ForegroundColor Red
             if ($f[1]) { Write-Host ('  ' + $f[1]) -ForegroundColor Yellow }
         }
+        if (-not $tlsOk) { Write-Host '  GSurf não foi instalado: só segue com o TLS testado OK.' -ForegroundColor Yellow }
         Write-Host ('  PDV em modo {0}.' -f (Get-NomeModo (Get-ModoAtual))) -ForegroundColor White
     }
     foreach ($f in $falhas) { Write-Log ('AUTO_FALHA: {0} | {1}' -f $f[0], $f[1]) }
