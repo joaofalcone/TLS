@@ -1104,6 +1104,8 @@ function Start-Progresso([string]$titulo) {
     if (-not $titulo) { $titulo = 'TLS' }
     $script:ProgressoAtivo = $true
     $script:UltMsgTela = ''
+    $script:UltPctTela = -1
+    $script:BarraNaTela = $false
     Write-Titulo $titulo
     Write-Dica 'Ctrl+C cancela e restaura a configuração anterior.'
 }
@@ -1113,13 +1115,53 @@ function Start-Progresso([string]$titulo) {
 # | O que faz: Atualiza a porcentagem e a etapa atual.
 # | Por quê:   Mostra o andamento sem encher a tela de mensagens.
 # +--------------------------------------------------------------------------+
+# +--------------------------------------------------------------------------+
+# | BARRA DE PROGRESSO
+# | O que faz: Desenha "[#####-----]  52%  etapa" sempre na mesma linha,
+# |            redesenhando por cima, e apaga a barra quando entra uma etapa
+# |            nova (a etapa fica numa linha acima).
+# | Por quê:   A faixa padrão do PowerShell aparecia no topo da janela e cobria
+# |            o texto. "#" e "-" aparecem certo em qualquer console, até no
+# |            Windows 7, e a linha nunca passa da largura da janela.
+# +--------------------------------------------------------------------------+
+function Get-LarguraLinha {
+    $w = 79
+    try { $w = [Console]::WindowWidth - 1 } catch { }
+    if ($w -lt 40) { $w = 40 }
+    return $w
+}
+
+function Write-Barra([int]$pct, [string]$msg) {
+    $w = Get-LarguraLinha
+    $n = 20
+    if ($w -ge 70) { $n = 28 }
+    $cheio = [int][Math]::Round($n * $pct / 100.0)
+    $resto = $w - 11 - $n
+    if ($resto -lt 0) { $resto = 0 }
+    $rot = [string]$msg
+    if ($rot.Length -gt $resto) { $rot = $rot.Substring(0, $resto) }
+    Write-Host "`r  [" -NoNewline -ForegroundColor Gray
+    if ($cheio -gt 0) { Write-Host ('#' * $cheio) -NoNewline -ForegroundColor Green }
+    if ($n - $cheio -gt 0) { Write-Host ('-' * ($n - $cheio)) -NoNewline -ForegroundColor DarkGray }
+    Write-Host '] ' -NoNewline -ForegroundColor Gray
+    Write-Host ('{0,3}%' -f $pct) -NoNewline -ForegroundColor Yellow
+    Write-Host ('  ' + $rot.PadRight($resto)) -NoNewline -ForegroundColor Cyan
+    $script:BarraNaTela = $true
+}
+
+function Clear-Barra {
+    if (-not $script:BarraNaTela) { return }
+    Write-Host ("`r" + (' ' * (Get-LarguraLinha)) + "`r") -NoNewline
+    $script:BarraNaTela = $false
+}
+
 function Set-Progresso([int]$pct, [string]$msg) {
     if (-not $script:ProgressoAtivo) { return }
     if ($pct -lt 0) { $pct = 0 }
     if ($pct -gt 100) { $pct = 100 }
     if (-not $msg) { $msg = $script:Rotulo }
-    Write-Progress -Activity 'TLS' -Status ('{0}  ({1}%)' -f $msg, $pct) -PercentComplete $pct
-    if ($msg -ne $script:UltMsgTela) { Write-Linhas ('> ' + $msg) 'Cyan'; $script:UltMsgTela = $msg }
+    if ($msg -ne $script:UltMsgTela) { Clear-Barra; Write-Linhas ('> ' + $msg) 'Cyan'; $script:UltMsgTela = $msg }
+    if ($pct -ne $script:UltPctTela -or -not $script:BarraNaTela) { Write-Barra $pct $msg; $script:UltPctTela = $pct }
     if ($pct -ne $script:UltPctLog -or $msg -ne $script:UltMsgLog) {
         Write-Log ('UI_PROGRESS={0}% MSG={1}' -f $pct, $msg)
         $script:UltPctLog = $pct; $script:UltMsgLog = $msg
@@ -1134,7 +1176,8 @@ function Set-Progresso([int]$pct, [string]$msg) {
 function Close-Progresso {
     if (-not $script:ProgressoAtivo) { return }
     $script:ProgressoAtivo = $false
-    try { Write-Progress -Activity 'TLS' -Status 'Concluído' -Completed } catch { }
+    # Termina a linha da barra (fica visível no último valor) e libera a tela.
+    if ($script:BarraNaTela) { Write-Host ''; $script:BarraNaTela = $false }
 }
 
 # +--------------------------------------------------------------------------+
