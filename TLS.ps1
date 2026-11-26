@@ -398,6 +398,7 @@ function Import-Nativo {
         $dll = Join-Path $seg $nome
         try {
             if (-not (Test-Path -LiteralPath $dll)) {
+                Write-Host '  > Preparando componentes (só na primeira vez neste PDV, alguns segundos)...' -ForegroundColor Gray
                 Add-Type -TypeDefinition $script:FonteNativa -Language CSharp -OutputAssembly $dll -OutputType Library
             }
             [void][Reflection.Assembly]::LoadFile($dll)
@@ -570,9 +571,20 @@ function Find-ChecksupIni {
         }
     } catch { }
     foreach ($c in $candidatos) {
-        try { if (Test-Path -LiteralPath $c) { return $c } } catch { }
+        try { if (Test-CaminhoRapido $c) { return $c } } catch { }
     }
     return ''
+}
+
+# Caminho de rede (\\servidor\...) fora do ar trava o Test-Path por até um minuto:
+# testa num runspace à parte e desiste em 3 s. Caminho local testa direto.
+function Test-CaminhoRapido([string]$c, [int]$ms = 3000) {
+    if ($c -notmatch '^\\\\') { return (Test-Path -LiteralPath $c) }
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript('param($c) [IO.File]::Exists($c)').AddArgument($c)
+    $h = $ps.BeginInvoke()
+    if (-not $h.AsyncWaitHandle.WaitOne($ms)) { return $false }
+    try { return [bool](@($ps.EndInvoke($h)) | Select-Object -First 1) } catch { return $false } finally { $ps.Dispose() }
 }
 
 # A senha nunca vai ao log, nem em parte: o mascaramento 2+2 revelava 4 de 5 letras.
@@ -993,7 +1005,7 @@ function Confirm-Ambiente {
 
     # Acha o Checksup.ini antes de elevar: o admin nao ve as unidades mapeadas.
     $ck = $ChecksupIni
-    if (-not $ck) { $ck = Find-ChecksupIni }
+    if (-not $ck) { Write-Host '  > Procurando o Checksup.ini...' -ForegroundColor Gray; $ck = Find-ChecksupIni }
     # Aspas no caminho (RemotePath do registro) injetariam parâmetros no processo elevado.
     if ($ck -match '"') { $ck = '' }
     if ($CheckoutDir -match '"') { Write-Host 'Pasta do Checkout inválida.'; exit 1 }
@@ -1005,6 +1017,8 @@ function Confirm-Ambiente {
         if ($Cred -notmatch '^[A-Za-z0-9+/=]{40,}$') { Write-Host 'Credencial do atalho inválida.'; exit 1 }
         $a += (' -Auto -Cred {0}' -f $Cred)
     }
+    if ($adm) { Write-Host '  > Abrindo a janela do InstalaTLS...' -ForegroundColor Gray }
+    else { Write-Host '  > Abrindo como administrador: confirme o aviso do Windows (Sim).' -ForegroundColor Yellow }
     try {
         if ($adm) { Start-Process -FilePath $ps -ArgumentList $a }
         else { Start-Process -FilePath $ps -ArgumentList $a -Verb RunAs }
@@ -2800,6 +2814,7 @@ function Open-CredAuto {
     $script:Auto = $true
     Write-Host ''
     Write-Host '  InstalaTLS - automático (GSurf + TLS)' -ForegroundColor White
+    Write-Host '  > Abrindo as credenciais...' -ForegroundColor Gray
     # Nome diferente de $Cred: no PowerShell maiúscula/minúscula é a mesma variável.
     $script:CredAberta = $null
     # Bloco gerado sem PIN (uso pessoal): abre direto, sem perguntar nada.
