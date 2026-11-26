@@ -53,7 +53,11 @@ param(
     [int]$TimeoutSeg = 120,
     [string]$CheckoutDir = 'C:\checkout',
     [string]$ChecksupIni = '',
-    [string]$Requisitos = ''
+    [string]$Requisitos = '',
+    [switch]$Auto,
+    [string]$Cred = '',
+    [string]$Certificado = '',
+    [string]$CredArq = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,6 +76,7 @@ $TLS_COL_TOKEN = 'tlstoken'
 $TLS_LOJA      = 0                      # igual ao Linux (tlsloja=0)
 $URL_TLS       = 'tls-prod.fiservapp.com'
 $TOKEN_REGEX   = '^[0-9]{4}(-[0-9]{4}){3}$'
+$AUTO_ITER     = 200000                 # PBKDF2 do PIN (igual ao -iter do openssl)
 
 $CONFITLS_INI     = Join-Path $CheckoutDir 'CONFITLS.INI'
 $CONFITLS_BKP_INI = Join-Path $CheckoutDir 'CONFITLS_BKP.INI'
@@ -291,6 +296,30 @@ public static class TlsTecla
         int w;
         WriteConsoleInputW(h, r, 2, out w);
         CloseHandle(h);
+    }
+    public static void Digitar(string s)
+    {
+        IntPtr h = CreateFileW("CONIN$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        REC[] r = new REC[s.Length * 2];
+        for (int i = 0; i < s.Length; i++)
+            for (int j = 0; j < 2; j++) { REC x = new REC(); x.type = 1; x.k.down = (j == 0) ? 1 : 0; x.k.rep = 1; x.k.ch = s[i]; r[i * 2 + j] = x; }
+        int w;
+        WriteConsoleInputW(h, r, r.Length, out w);
+        CloseHandle(h);
+    }
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool ReadConsoleOutputCharacterW(IntPtr h, System.Text.StringBuilder sb, int len, int coord, out int lido);
+    public static string Tela(int linhas, int larg)
+    {
+        IntPtr h = CreateFileW("CONOUT$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        System.Text.StringBuilder tudo = new System.Text.StringBuilder();
+        for (int y = 0; y < linhas; y++)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder(larg + 1); sb.Length = larg; int l;
+            if (ReadConsoleOutputCharacterW(h, sb, larg, y << 16, out l)) tudo.AppendLine(sb.ToString(0, Math.Min(l, sb.Length)).TrimEnd());
+        }
+        CloseHandle(h);
+        return tudo.ToString();
     }
 }
 '@
@@ -619,6 +648,10 @@ function Read-ConfigBanco {
             if ($partes.Count -ge 3) {
                 $cfg.Usuario = $partes[1]
                 $cfg.Senha = Unprotect-SenhaHipcom $partes[2]
+            } elseif ($partes.Count -eq 1 -and $script:CredAberta -and $script:CredAberta.Root) {
+                # Sem usuário = root. A senha do root só existe no atalho cifrado (modo automático).
+                $cfg.Usuario = 'root'
+                $cfg.Senha = $script:CredAberta.Root
             } else {
                 $ci = Read-CredIntegracao
                 $cfg.Usuario = $ci.Usuario
@@ -899,6 +932,40 @@ if ($Requisitos) {
     exit 0
 }
 
+# +--------------------------------------------------------------------------+
+# | MODO CERTIFICADO AUTOMÁTICO (processo filho num console oculto)
+# | O que faz: Lê login, senha e OTP do arquivo da pasta protegida (e apaga
+# |            na hora), roda o InstaladorGSurf.exe e digita as três respostas
+# |            neste console oculto. No fim, grava o texto da tela (com a senha
+# |            trocada por ****) para o processo principal saber o resultado.
+# | Por quê:   Instalar o certificado sem ninguém digitar e sem expor a senha.
+# +--------------------------------------------------------------------------+
+if ($Certificado) {
+    Import-Nativo
+    $resp = @([IO.File]::ReadAllLines($CredArq))
+    [IO.File]::Delete($CredArq)
+    $senhaTela = ''
+    if ($resp.Count -ge 2) { $senhaTela = $resp[1] }
+    $p = Start-Process -FilePath $Certificado -WorkingDirectory (Split-Path -Parent $Certificado) -NoNewWindow -PassThru
+    Start-Sleep -Milliseconds 1500
+    foreach ($v in $resp) { try { [TlsTecla]::Digitar($v); [TlsTecla]::Enter() } catch { }; Start-Sleep -Milliseconds 700 }
+    $resp = $null
+    $t0 = Get-Date
+    while (-not $p.HasExited -and ((Get-Date) - $t0).TotalSeconds -lt 180) {
+        Start-Sleep -Milliseconds 500
+        # Passado o tempo de instalar, Enter responde o "pressione uma tecla" do fim.
+        if (((Get-Date) - $t0).TotalSeconds -gt 8) { try { [TlsTecla]::Enter() } catch { } }
+    }
+    $rc = 98
+    if ($p.HasExited) { $rc = $p.ExitCode } else { try { $p.Kill() } catch { } }
+    $tela = ''
+    try { $tela = [TlsTecla]::Tela(60, 120) } catch { }
+    if ($senhaTela) { $tela = $tela.Replace($senhaTela, '****') }
+    $senhaTela = $null
+    try { [IO.File]::WriteAllText($Status, $tela) } catch { }
+    exit $rc
+}
+
 # =========================================================
 # AMBIENTE: 32-bit + administrador + STA (relanca se preciso)
 # =========================================================
@@ -933,6 +1000,11 @@ function Confirm-Ambiente {
 
     $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -CheckoutDir "{1}"' -f $script:SelfPath, $CheckoutDir
     if ($ck) { $a += (' -ChecksupIni "{0}"' -f $ck.TrimEnd('\')) }
+    # Modo automático: o bloco cifrado só tem letras de base64 (validado: nada de aspas).
+    if ($Auto) {
+        if ($Cred -notmatch '^[A-Za-z0-9+/=]{40,}$') { Write-Host 'Credencial do atalho inválida.'; exit 1 }
+        $a += (' -Auto -Cred {0}' -f $Cred)
+    }
     try {
         if ($adm) { Start-Process -FilePath $ps -ArgumentList $a }
         else { Start-Process -FilePath $ps -ArgumentList $a -Verb RunAs }
@@ -997,6 +1069,7 @@ function Split-Linhas([string]$texto, [int]$larg) {
 # |            recomendação.
 # +--------------------------------------------------------------------------+
 function Write-Linhas([string]$texto, [string]$cor) {
+    if ($script:Quieto) { return }
     if (-not $cor) { $cor = 'White' }
     foreach ($l in (Split-Linhas $texto (Get-LarguraTexto))) { Write-Host ('  ' + $l) -ForegroundColor $cor }
 }
@@ -1020,6 +1093,7 @@ function Write-Faixa([string]$texto, [string]$fundo, [string]$frente) {
 # | Por quê:   O operador sabe em que parte do processo está.
 # +--------------------------------------------------------------------------+
 function Write-Titulo([string]$texto) {
+    if ($script:Quieto) { return }
     Write-Host ''
     $l = @($texto -split "`r?`n")
     # Título só com letra clara (sem fundo): fundo colorido fica só para a opção selecionada.
@@ -1034,6 +1108,7 @@ function Write-Titulo([string]$texto) {
 # | Por quê:   Leitura rápida dos dados do PDV.
 # +--------------------------------------------------------------------------+
 function Write-Campo([string]$rotulo, [string]$valor, [string]$cor) {
+    if ($script:Quieto) { return }
     if (-not $cor) { $cor = 'Yellow' }
     $tamRot = 14
     $larg = Get-LarguraTexto
@@ -1052,7 +1127,7 @@ function Write-Campo([string]$rotulo, [string]$valor, [string]$cor) {
 # | O que faz: Mostra uma dica discreta em cinza.
 # | Por quê:   Informação de apoio que não deve chamar atenção.
 # +--------------------------------------------------------------------------+
-function Write-Dica([string]$texto) { Write-Host ('  ' + $texto) -ForegroundColor DarkGray }
+function Write-Dica([string]$texto) { if ($script:Quieto) { return }; Write-Host ('  ' + $texto) -ForegroundColor DarkGray }
 
 # +--------------------------------------------------------------------------+
 # | LER O QUE O OPERADOR DIGITA
@@ -1072,6 +1147,7 @@ function Read-Campo([string]$rotulo) {
 # +--------------------------------------------------------------------------+
 function Show-Mensagem([string]$texto, [string]$tipo) {
     Write-Log ('UI_MSG[{0}]={1}' -f $tipo, ($texto -replace '[\r\n]+', ' | '))
+    if ($script:Quieto) { return }
     Write-Host ''
     if ($tipo -eq 'erro') { Write-Faixa 'ERRO' 'DarkRed' 'White'; Write-Linhas $texto 'Red' }
     elseif ($tipo -eq 'aviso') { Write-Faixa 'ATENÇÃO' 'DarkYellow' 'Black'; Write-Linhas $texto 'Yellow' }
@@ -1408,7 +1484,7 @@ function Confirm-CaixaFechado {
     $procs = @(Get-Process -Name 'Checkout' -ErrorAction SilentlyContinue)
     if ($procs.Count -eq 0) { Write-Log 'CHECKOUT_EM_EXECUCAO=0'; return $true }
     Write-Log ('CHECKOUT_EM_EXECUCAO={0}' -f $procs.Count)
-    if (-not (Ask-SimNao "O Checkout está aberto e precisa ser fechado para o teste.`r`n`r`nFechar o Checkout agora?")) { return $false }
+    if (-not $script:Auto -and -not (Ask-SimNao "O Checkout está aberto e precisa ser fechado para o teste.`r`n`r`nFechar o Checkout agora?")) { return $false }
     foreach ($p in $procs) { try { [void]$p.CloseMainWindow() } catch { } }
     for ($i = 0; $i -lt 20; $i++) {
         if (@(Get-Process -Name 'Checkout' -ErrorAction SilentlyContinue).Count -eq 0) { break }
@@ -2350,6 +2426,7 @@ function Test-RequisitosGsurf {
         if ($x -match '\[\s*OK\s*\]\s*(.*)$') { $oks++; Write-Linhas ('[ OK ] ' + $matches[1]) 'Green' }
         elseif ($x -match '\[\s*ERRO\s*\]\s*(.*)$') {
             $erros++
+            if (-not $script:ReqFalha) { $script:ReqFalha = $matches[1] + ' | ' + (Get-DicaRequisito $matches[1]) }
             Write-Linhas ('[ERRO] ' + $matches[1]) 'Red'
             Write-Linhas ('       ' + (Get-DicaRequisito $matches[1])) 'Yellow'
         }
@@ -2363,6 +2440,7 @@ function Test-RequisitosGsurf {
         Write-Linhas ('[ERRO] Sem resposta em: ' + $etapa) 'Red'
         Write-Linhas ('       ' + (Get-DicaRequisito $etapa)) 'Yellow'
         Write-Log ('REQUISITOS_INCOMPLETO etapa={0}' -f $etapa)
+        if (-not $script:ReqFalha) { $script:ReqFalha = 'sem resposta em: ' + $etapa + ' | ' + (Get-DicaRequisito $etapa) }
         return $false
     }
     if ($oks -eq 0) {
@@ -2632,6 +2710,224 @@ function Invoke-TestarGsurf {
 # MAIN
 # =========================================================
 
+
+# =========================================================
+# MODO AUTOMÁTICO (TLS + GSurf de uma vez)
+# =========================================================
+
+# +--------------------------------------------------------------------------+
+# | LER SENHA SEM MOSTRAR
+# | O que faz: Lê o que o operador digita sem mostrar na tela (asteriscos).
+# | Por quê:   O PIN não pode aparecer na tela nem no histórico.
+# +--------------------------------------------------------------------------+
+function Read-Senha([string]$rotulo) {
+    Write-Host ('  ' + $rotulo + ' ') -NoNewline -ForegroundColor Cyan
+    $seg = Read-Host -AsSecureString
+    $p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($seg)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }
+}
+
+# +--------------------------------------------------------------------------+
+# | ABRIR A CREDENCIAL DA GSURF COM O PIN
+# | O que faz: Decifra (AES-256 com chave tirada do PIN) o login e a senha da
+# |            GSurf que vêm cifrados no atalho.
+# | Por quê:   Login e senha nunca ficam abertos em lugar nenhum; sem o PIN
+# |            certo o bloco cifrado não revela nada. Formato igual ao do
+# |            "openssl enc -aes-256-cbc -pbkdf2 -md sha1" (o Linux usa o mesmo).
+# +--------------------------------------------------------------------------+
+function Unprotect-CredAuto([string]$b64, [string]$pin) {
+    $d = [Convert]::FromBase64String($b64)
+    if ($d.Length -lt 32 -or [Text.Encoding]::ASCII.GetString($d, 0, 8) -ne 'Salted__') { throw 'credencial inválida' }
+    $salt = New-Object byte[] 8
+    [Array]::Copy($d, 8, $salt, 0, 8)
+    $kdf = New-Object Security.Cryptography.Rfc2898DeriveBytes($pin, $salt, $AUTO_ITER)
+    $aes = New-Object Security.Cryptography.RijndaelManaged
+    $aes.KeySize = 256; $aes.BlockSize = 128
+    $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = $kdf.GetBytes(32); $aes.IV = $kdf.GetBytes(16)
+    $dec = $aes.CreateDecryptor()
+    $txt = [Text.Encoding]::UTF8.GetString($dec.TransformFinalBlock($d, 16, $d.Length - 16))
+    # 1a linha "TLS1" é a marca: PIN errado que por acaso "decifre" vira lixo sem ela.
+    $l = $txt -split "`n"
+    if ($l.Count -lt 3 -or $l[0] -ne 'TLS1' -or -not $l[1] -or -not $l[2]) { throw 'credencial inválida' }
+    # 4a linha (opcional): senha do root do banco, usada quando o Checksup.ini não tem usuário.
+    $root = ''
+    if ($l.Count -ge 4) { $root = $l[3] }
+    return @{ Login = $l[1]; Senha = $l[2]; Root = $root }
+}
+
+# +--------------------------------------------------------------------------+
+# | CERTIFICADO GSURF SEM PERGUNTAS
+# | O que faz: Roda o instalador do certificado num console oculto e digita
+# |            login, senha e OTP por ele. A credencial passa por um arquivo na
+# |            pasta protegida, que o processo filho apaga ao ler.
+# | Por quê:   Nada de credencial na linha de comando (visível a outros
+# |            programas) nem na tela.
+# +--------------------------------------------------------------------------+
+function Install-CertificadoGsurfAuto([string]$login, [string]$senha, [string]$otp) {
+    $travados = Lock-Gsurf $GSURF_CERTIFICADO
+    [string]$arq = Join-Path $script:TmpDir ('c_' + [Guid]::NewGuid().ToString('N'))
+    [string]$st = Join-Path $script:TmpDir ('s_' + [Guid]::NewGuid().ToString('N'))
+    $rc = 97
+    try {
+        $exe = Join-Path $GSURF_DIR $GSURF_CERTIFICADO[0]
+        [IO.File]::WriteAllLines($arq, [string[]]@($login, $senha, $otp))
+        $psExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Certificado "{1}" -CredArq "{2}" -Status "{3}"' -f (Get-ScriptFilho), $exe, $arq, $st
+        $p = Start-Process -FilePath $psExe -ArgumentList $a -WindowStyle Hidden -PassThru
+        if ($p.WaitForExit(200000)) { $rc = $p.ExitCode } else { try { $p.Kill() } catch { }; $rc = 98 }
+    } finally {
+        Close-Travados $travados
+        if ([IO.File]::Exists($arq)) { [IO.File]::Delete($arq) }
+    }
+    $tela = ''
+    if ([IO.File]::Exists($st)) { $tela = [IO.File]::ReadAllText($st); [IO.File]::Delete($st) }
+    Write-Log ('CERTIFICADO_AUTO_RC={0}' -f $rc)
+    return @{ Rc = $rc; Tela = $tela }
+}
+
+# +--------------------------------------------------------------------------+
+# | PEDIR O PIN E ABRIR A CREDENCIAL
+# | O que faz: Pede o PIN (até 3 vezes) e abre o bloco cifrado do atalho:
+# |            login e senha da GSurf e a senha do root do banco.
+# | Por quê:   É a primeira coisa do modo automático, porque a senha do root
+# |            é usada para conectar no banco quando o Checksup.ini não tem
+# |            usuário.
+# +--------------------------------------------------------------------------+
+function Open-CredAuto {
+    $script:Auto = $true
+    Write-Host ''
+    Write-Host '  InstalaTLS - automático (GSurf + TLS)' -ForegroundColor White
+    # Nome diferente de $Cred: no PowerShell maiúscula/minúscula é a mesma variável.
+    $script:CredAberta = $null
+    for ($t = 1; $t -le 3 -and -not $script:CredAberta; $t++) {
+        $pin = Read-Senha 'PIN:'
+        try { $script:CredAberta = Unprotect-CredAuto $Cred $pin } catch { Write-Log ('PIN_RECUSADO: ' + (Get-MsgErro $_)); Write-Host '  PIN incorreto.' -ForegroundColor Red }
+        $pin = $null
+    }
+    if (-not $script:CredAberta) { Write-Host '  ERRO: PIN incorreto 3 vezes.' -ForegroundColor Red; Complete-Log; Exit-Script 1 }
+}
+
+# +--------------------------------------------------------------------------+
+# | MODO AUTOMÁTICO
+# | O que faz: Pede PIN e token, instala GSurf (requisitos, serviço e
+# |            certificado; pede o OTP na hora do certificado para não
+# |            vencer), instala TLS, testa os dois e deixa em GSurf. Mostra só
+# |            OK ou ERRO com o local e a dica.
+# | Por quê:   Instalação completa em uma tacada, sem menus.
+# +--------------------------------------------------------------------------+
+function Invoke-Automatico {
+    # O PIN já foi pedido em Open-CredAuto (antes do banco: a senha do root vem dele).
+    $credAberta = $script:CredAberta
+    $tok = ''
+    while ($tok -notmatch $TOKEN_REGEX) {
+        $tok = ([string](Read-Campo 'Token TLS (0000-0000-0000-0000):')) -replace '\s', ''
+        if ($tok -notmatch $TOKEN_REGEX) { Write-Host '  Token inválido.' -ForegroundColor Red }
+    }
+
+    $script:Quieto = $true
+    $script:Rotulo = 'Instalando'
+    Start-Progresso 'auto'
+    $falhas = @()
+    $gsurfOk = $false
+
+    # 1) GSurf: arquivos, requisitos, serviço e certificado.
+    try {
+        Set-Progresso 3 'GSurf: preparando arquivos'
+        if (-not (Test-Path -LiteralPath $GSURF_DIR)) { Expand-PacoteGsurf }
+        Set-Progresso 8 'GSurf: verificando requisitos'
+        $script:ReqFalha = ''
+        if (-not (Test-RequisitosGsurf)) { throw ('requisitos | ' + $script:ReqFalha) }
+        Set-Progresso 20 'GSurf: instalando o serviço'
+        Install-ServicoGsurf
+        Clear-Barra
+        $otp = ''
+        while (-not $otp) { $otp = ([string](Read-Campo 'OTP GSurf:')).Trim() }
+        Set-Progresso 30 'GSurf: instalando o certificado'
+        $c = Install-CertificadoGsurfAuto $credAberta.Login $credAberta.Senha $otp
+        $otp = $null
+        if ($c.Rc -ne 0 -and $c.Tela -notmatch '(?i)sucesso') {
+            $fim = @(($c.Tela -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' / '
+            throw ('certificado | {0} (código {1}) | Confira o OTP (vence em segundos) e rode de novo.' -f $fim, $c.Rc)
+        }
+        $gsurfOk = $true
+    } catch {
+        # Mensagem "etapa | detalhe | dica" (ou "detalhe | dica"). Parênteses em cada
+        # item: no PowerShell a vírgula se junta antes do "+".
+        $p = @((Get-MsgErro $_) -split ' \| ')
+        if ($p.Count -ge 3) { $falhas += ,@(('GSurf - ' + $p[0] + ': ' + $p[1]), $p[2]) }
+        elseif ($p.Count -eq 2) { $falhas += ,@(('GSurf - instalação: ' + $p[0]), $p[1]) }
+        else { $falhas += ,@(('GSurf - instalação: ' + $p[0]), '') }
+    }
+    $credAberta = $null
+    $script:CredAberta = $null
+
+    # 2) TLS: token, CONFITLS.INI, controle e teste.
+    $tlsOk = $false
+    try {
+        Set-Progresso 45 'TLS: gravando o token'
+        [void](Confirm-CaixaFechado)
+        Save-EstadoOriginal
+        $script:TokenTls = $tok
+        Write-TokenMysql
+        Write-ConfiTls
+        Confirm-Gravacoes
+        Remove-ControleTls
+        $script:RollbackOn = $false
+        $script:Rotulo = 'TLS: testando a comunicação'
+        $r = Invoke-TesteSiTef 'TLS' 50 70
+        if ($r.Codigo -eq 0) { $tlsOk = $true }
+        else {
+            $m = $r.Msg; if (-not $m) { $m = $r.Util }; if (-not $m) { $m = 'Sem retorno' }
+            $falhas += ,@(('TLS - teste de comunicação: ' + $m), (Get-DicaFalha 'TLS' $m))
+        }
+    } catch {
+        $e = Get-MsgErro $_
+        Invoke-Rollback
+        $falhas += ,@(('TLS - instalação: ' + $e), 'A configuração TLS anterior foi restaurada.')
+    }
+
+    # 3) GSurf: modo GSurf e teste.
+    $gsurfTesteOk = $false
+    if ($gsurfOk) {
+        try {
+            Set-Progresso 75 'GSurf: testando a comunicação'
+            Switch-Gsurf
+            $script:Rotulo = 'GSurf: testando a comunicação'
+            $r = Invoke-TesteSiTef 'GSURF' 78 98
+            if ($r.Codigo -eq 0) { $gsurfTesteOk = $true }
+            else {
+                $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
+                $falhas += ,@(('GSurf - teste de comunicação: ' + $m), (Get-DicaFalha 'GSURF' $m))
+            }
+        } catch { $falhas += ,@(('GSurf - modo GSurf: ' + (Get-MsgErro $_)), '') }
+    }
+
+    # Fica em GSurf se GSurf comunica; senão em TLS se TLS comunica.
+    if (-not $gsurfTesteOk -and $tlsOk) { try { Mount-Tls } catch { } }
+    Set-Progresso 100 'Concluído'
+    Close-Progresso
+    $script:Quieto = $false
+
+    Write-Host ''
+    if ($falhas.Count -eq 0) {
+        Write-Host '  OK - GSurf e TLS instalados e testados. PDV em modo GSurf.' -ForegroundColor Green
+    } else {
+        foreach ($f in $falhas) {
+            Write-Host ('  ERRO em ' + $f[0]) -ForegroundColor Red
+            if ($f[1]) { Write-Host ('  ' + $f[1]) -ForegroundColor Yellow }
+        }
+        Write-Host ('  PDV em modo {0}.' -f (Get-NomeModo (Get-ModoAtual))) -ForegroundColor White
+    }
+    foreach ($f in $falhas) { Write-Log ('AUTO_FALHA: {0} | {1}' -f $f[0], $f[1]) }
+    if ($script:CheckoutFoiFechado) { Write-Host '  Abra o Checkout de novo pelo atalho de sempre.' -ForegroundColor Gray }
+    Complete-Log
+    if ($falhas.Count -eq 0) { Exit-Script 0 }
+    Exit-Script 1
+}
+
 # +--------------------------------------------------------------------------+
 # | INÍCIO E MENU PRINCIPAL
 # | O que faz: Lê os dados do PDV, conecta no banco e mostra o menu até o
@@ -2647,12 +2943,15 @@ function Invoke-Principal {
     Write-Log ('PS_VERSION={0} PROCESSO_32BIT={1}' -f $PSVersionTable.PSVersion, ([IntPtr]::Size -eq 4))
     Write-Log ('CHECKSUP_INI={0}' -f $script:ChecksupIniUsado)
 
+    if ($Auto) { Open-CredAuto }
     Write-Dica 'Lendo dados do PDV...'
     Confirm-Arquivos
     Read-DadosPdv
     Connect-Banco
     Confirm-Estrutura
     Read-Identificacao
+
+    if ($Auto) { Invoke-Automatico }
 
     while ($true) {
         Show-Pdv

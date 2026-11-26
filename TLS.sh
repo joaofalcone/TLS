@@ -23,6 +23,13 @@ fi
 # FD 3 = terminal do operador (as etapas mandam stdout/stderr para o log).
 exec 3>&1
 
+# Modo automático: "./TLS.sh --auto <bloco cifrado>" (o bloco só tem letras de base64).
+AUTO_CRED=""
+if [[ "${1:-}" == "--auto" ]]; then
+  AUTO_CRED="${2:-}"
+  [[ "$AUTO_CRED" =~ ^[A-Za-z0-9+/=]{40,}$ ]] || { printf 'Credencial do atalho inválida.\n' >&2; exit 1; }
+fi
+
 # =========================================================
 # INSTALATLS — CONFIGURAÇÃO INICIAL / CAMINHOS / CONSTANTES
 # =========================================================
@@ -3146,6 +3153,198 @@ acao_testar_gsurf(){
   fim_teste GSURF "${FINAL_MODE_TEST_OK:-0}" "${FINAL_MODE_TEST_MSG:-Sem retorno}"
 }
 
+# =========================================================
+# MODO AUTOMÁTICO (TLS + GSurf de uma vez)
+# =========================================================
+
+readonly AUTO_ITER=200000   # PBKDF2 do PIN (igual ao Windows)
+
+# +--------------------------------------------------------------------------+
+# | LER SEM MOSTRAR
+# | O que faz: Lê o que o operador digita sem mostrar na tela.
+# | Por quê:   O PIN não pode aparecer na tela.
+# +--------------------------------------------------------------------------+
+ler_oculto(){
+  local v=""
+  if { exec 4</dev/tty; } 2>/dev/null; then
+    IFS= read -rs v <&4 || { exec 4<&-; kill -TERM $$; exit 130; }
+    exec 4<&-
+  else
+    IFS= read -rs v || { kill -TERM $$; exit 130; }
+  fi
+  printf '%s' "$v"
+}
+
+# +--------------------------------------------------------------------------+
+# | INSTALADOR GSURF SEM PERGUNTAS
+# | O que faz: Roda o /gsurf/instalador num terminal próprio e responde login,
+# |            senha e OTP por ele. As respostas vão pela memória do processo
+# |            (variáveis só do root), nunca pela linha de comando. A saída vai
+# |            para o log com a senha trocada por ****.
+# | Por quê:   Instalar sem ninguém digitar e sem expor a senha.
+# +--------------------------------------------------------------------------+
+read -r -d '' AUTO_PTY <<'PY' || true
+import os, pty, sys, time, select
+l, s, o = os.environ.pop('GS_L'), os.environ.pop('GS_S'), os.environ.pop('GS_O')
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv('./instalador', ['./instalador'])
+saida = b''
+def ler(t):
+    global saida
+    fim = time.time() + t
+    while time.time() < fim:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                b = os.read(fd, 4096)
+            except OSError:
+                return False
+            if not b:
+                return False
+            saida += b
+    return True
+ler(1.5)
+for v in (l, s, o):
+    os.write(fd, (v + '\n').encode())
+    ler(1.0)
+fim = time.time() + 180
+while time.time() < fim and ler(1.0):
+    pass
+_, st = os.waitpid(pid, 0)
+txt = saida.decode('utf-8', 'replace').replace(s, '****')
+sys.stdout.write(txt)
+sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 98)
+PY
+
+instalar_gsurf_auto(){
+  local login="$1" senha="$2" otp="$3"
+  [[ -f "${GSURF_DIR}/instalador" ]] || { printf 'instalador não encontrado em %s' "$GSURF_DIR"; return 1; }
+  if [[ -L "$GSURF_DIR" || -L "${GSURF_DIR}/instalador" ]]; then printf 'instalador em %s é um link' "$GSURF_DIR"; return 1; fi
+  if [[ ! -O "$GSURF_DIR" || ! -O "${GSURF_DIR}/instalador" ]]; then chown root:root "$GSURF_DIR" "${GSURF_DIR}/instalador" 2>>"$AUDIT_TMP" || true; fi
+  chmod 0755 "$GSURF_DIR" "${GSURF_DIR}/instalador" 2>/dev/null || true
+  local rc=0
+  set +e
+  if command -v python3 >/dev/null 2>&1; then
+    ( cd "$GSURF_DIR" && GS_L="$login" GS_S="$senha" GS_O="$otp" python3 -c "$AUTO_PTY" ) >>"$AUDIT_TMP" 2>&1 9>&-
+    rc=$?
+  else
+    ( cd "$GSURF_DIR" && printf '%s\n%s\n%s\n' "$login" "$senha" "$otp" | ./instalador ) 2>&1 | sed "s/$(printf '%s' "$senha" | sed 's/[][\/.^$*]/\\&/g')/****/g" >>"$AUDIT_TMP" 9>&-
+    rc=${PIPESTATUS[0]}
+  fi
+  set -e
+  log "GSURF_INSTALADOR_AUTO_RC=${rc}"
+  if (( rc != 0 )); then printf 'o instalador terminou com erro (código %s)' "$rc"; return 1; fi
+  if ! { systemctl daemon-reload && systemctl enable "$GSURF_SERVICO" && systemctl stop "$GSURF_SERVICO" && systemctl start "$GSURF_SERVICO"; } >>"$AUDIT_TMP" 2>&1; then
+    printf 'falha ao ativar o serviço %s' "$GSURF_SERVICO"; return 1
+  fi
+  sleep 1
+  systemctl is-active --quiet "$GSURF_SERVICO" || { printf 'o serviço %s não ficou ativo' "$GSURF_SERVICO"; return 1; }
+  return 0
+}
+
+# +--------------------------------------------------------------------------+
+# | MODO AUTOMÁTICO
+# | O que faz: Pede PIN, token e OTP; instala GSurf (instalador + serviço),
+# |            instala TLS, testa os dois e deixa em GSurf. Mostra só OK ou
+# |            ERRO com o local e a dica.
+# | Por quê:   Instalação completa em uma tacada, sem menus.
+# +--------------------------------------------------------------------------+
+modo_auto(){
+  local t cred="" m="" login="" senha="" tok="" otp="" erro="" okT=0 okG=0 gsurf=0
+  local -a falhas=()
+  ui_out '\n  %sInstalaTLS - automático (GSurf + TLS)%s\n' "$C_TIT" "$C_RST"
+  if ! command -v openssl >/dev/null 2>&1; then ui_erro "ERRO: openssl não encontrado neste PDV."; exit 1; fi
+
+  for t in 1 2 3; do
+    ui_out '  %sPIN:%s ' "$C_PER" "$C_RST"
+    local pin; pin="$(ler_oculto)"; ui_out '\n'
+    cred="$(printf '%s' "$AUTO_CRED" | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$AUTO_ITER" -md sha1 -a -A -pass fd:3 3<<<"$pin" 2>/dev/null || true)"
+    pin=""
+    if [[ "${cred%%$'\n'*}" == "TLS1" ]]; then break; fi
+    cred=""
+    ui_erro "PIN incorreto."
+  done
+  if [[ -z "$cred" ]]; then ui_erro "ERRO: PIN incorreto 3 vezes."; exit 1; fi
+  { IFS= read -r m; IFS= read -r login; IFS= read -r senha; } <<<"$cred"
+  cred=""
+
+  while true; do
+    ui_out '  %sToken TLS (0000-0000-0000-0000):%s ' "$C_PER" "$C_RST"
+    tok="$(ler | tr -d '[:space:]')"
+    if [[ "$tok" =~ ^[0-9]{4}(-[0-9]{4}){3}$ ]]; then break; fi
+    ui_erro "Token inválido."
+  done
+  while [[ -z "$otp" ]]; do
+    ui_out '  %sOTP GSurf:%s ' "$C_PER" "$C_RST"
+    otp="$(ler | tr -d '[:space:]')"
+  done
+
+  UI_OK=1; UI_PCT=0; LAST_UI_LOOP_PCT=""
+  # 1) GSurf: instalador (login, senha e OTP) e serviço.
+  ui_progress 5 "GSurf: instalando"
+  if erro="$(instalar_gsurf_auto "$login" "$senha" "$otp")"; then gsurf=1
+  else falhas+=("GSurf - instalação: ${erro}|Confira o OTP (vence em segundos), login/senha da GSurf e o serviço ${GSURF_SERVICO}.")
+  fi
+  login=""; senha=""; otp=""
+
+  # 2) TLS: chave, token, CONFITLS.INI, serviço e teste.
+  nova_acao "auto_tls"
+  TOKEN_TLS="$tok"
+  UI_TEST_LABEL="TLS: testando a comunicação"
+  ui_progress 30 "TLS: gravando o token"
+  erro=""
+  ui_step_min "Capturando estado original" capture_original_state || erro="capturar o estado original"
+  [[ -n "$erro" ]] || ui_step_min "Ajustando modo TLS" step_set_flag_tls || erro="ajustar o modo TLS"
+  [[ -n "$erro" ]] || ui_step_min "Registrando token" step_write_mysql || erro="gravar o token no banco"
+  [[ -n "$erro" ]] || ui_step_min "Gerando CONFITLS.INI" write_confitls_ini || erro="gerar o CONFITLS.INI"
+  [[ -n "$erro" ]] || ui_step_min "Reiniciando serviço TEF" step_prepare_tls_runtime_for_new_token || erro="reiniciar o serviço do TEF"
+  if [[ -n "$erro" ]]; then
+    run_rollback || true
+    falhas+=("TLS - instalação: falha ao ${erro}|A configuração TLS anterior foi restaurada.")
+  else
+    ROLLBACK_ENABLED=0
+    if ui_step_min "TLS: testando a comunicação" run_integrated_tls_test 40; then okT=1
+    else falhas+=("TLS - teste de comunicação: ${TEST_RESULT_MSG:-Sem retorno}|$(dica_falha TLS "${TEST_RESULT_MSG:-}")")
+    fi
+  fi
+
+  # 3) GSurf: modo GSurf e teste.
+  if (( gsurf == 1 )); then
+    UI_TEST_LABEL="GSurf: testando a comunicação"
+    ui_progress 70 "GSurf: testando a comunicação"
+    if ui_step_min "Montando ambiente GSurf" step_switch_to_gsurf; then
+      ui_step_min "GSurf: testando a comunicação" step_validate_final_mode GSURF || true
+      if [[ "${FINAL_MODE_TEST_OK:-0}" == "1" ]]; then okG=1
+      else falhas+=("GSurf - teste de comunicação: ${FINAL_MODE_TEST_MSG:-Sem retorno}|$(dica_falha GSURF "${FINAL_MODE_TEST_MSG:-}")")
+      fi
+    else
+      falhas+=("GSurf - modo GSurf: falha ao montar o ambiente|")
+    fi
+  fi
+
+  # Fica em GSurf se GSurf comunica; senão em TLS se TLS comunica.
+  if (( okG == 0 && okT == 1 )); then ui_step_min "Montando ambiente TLS" step_prepare_tls_for_existing_token_test || true; fi
+  ui_progress 100 "Concluído"
+  ui_finish_progress
+
+  ui_out '\n'
+  if (( ${#falhas[@]} == 0 )); then
+    ui_ok "OK - GSurf e TLS instalados e testados. PDV em modo GSurf."
+  else
+    local f
+    for f in "${falhas[@]}"; do
+      ui_erro "ERRO em ${f%%|*}"
+      if [[ -n "${f#*|}" ]]; then ui_aviso "${f#*|}"; fi
+      log "AUTO_FALHA: ${f}"
+    done
+    ui_out '  PDV em modo %s.\n' "$(nome_modo "$(modo_atual)")"
+  fi
+  ui_dica "Log: ${FINAL_LOG_FILE}"
+  if (( ${#falhas[@]} == 0 )); then exit 0; fi
+  exit 1
+}
+
 # +--------------------------------------------------------------------------+
 # | INÍCIO DA EXECUÇÃO
 # | O que faz: Instala o que falta, confere os programas, lê os dados do PDV
@@ -3178,6 +3377,8 @@ check_sqlite_integrity || die "Falha de integridade no banco SQLite"
 ui_step_min "Coletando dados básicos do PDV" step_collect_cfg || die "Falha ao ler os dados do PDV"
 ui_step_min "Validando estrutura de banco" check_required_schema || die "Estrutura de banco inválida ou incompleta"
 ui_step_min "Coletando contexto TLS" step_finalize_tls_context || die "Falha ao coletar o contexto TLS"
+
+if [[ -n "$AUTO_CRED" ]]; then modo_auto; fi
 
 while true; do
   mostrar_pdv
