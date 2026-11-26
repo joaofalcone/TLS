@@ -7,19 +7,23 @@ Tudo no terminal, sem janelas e sem login:
 ```
 1 - Cadastrar TLS   (pede o token, monta o ambiente TLS e testa)
 2 - Instalar GSurf  (Windows: requisitos + serviço "sitef" + certificado;
-                     Linux: /gsurf/instalador + libssl.service)
+                     Linux: /gsurf/instalador + libssl.service) e testa
 3 - Testar TLS      (monta o ambiente TLS com o token do banco e testa)
 4 - Testar GSurf    (monta o ambiente GSurf e testa)
 0 - Sair
 ```
 
-Número ou setas destacam a opção; Enter confirma. Depois de cada teste:
+Número ou setas destacam a opção; Enter confirma. Depois de cada teste (ex.: TLS):
 
 ```
-1 - Manter <modo testado> e sair
-2 - Mudar para <outro modo> e sair   (testa antes; se falhar, pergunta se mantém o anterior)
-3 - Voltar
+1 - Mudar para GSurf          (testa na hora)
+2 - Voltar para o menu inicial
+3 - Deixar como TLS e sair
 ```
+
+Ao mudar: se o teste passar, "PDV em modo de comunicação GSurf. Testes realizados com sucesso.";
+se falhar, mostra onde falhou e a dica para corrigir, e volta sozinho para o modo que estava funcionando.
+Em seguida: `1 - Voltar para o menu principal` / `2 - Sair [ou pressione Esc]`.
 
 Windows: o Instalar GSurf usa `C:\tef\VPN RSA Integrador - Hospedado`; se a pasta não existir, baixa
 `gsurf/VPN-RSA-Integrador-Hospedado.exe` deste repositório, confere o SHA-256 e extrai em silêncio.

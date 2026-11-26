@@ -4,8 +4,8 @@
     menu 1 Cadastrar TLS | 2 Instalar GSurf | 3 Testar TLS | 4 Testar GSurf
     cada opcao monta o ambiente (snapshot -> grava pdvtls/CONFITLS.INI ou
     tira o INI) e faz o teste real (funcao 110 da CliSiTef); falha antes do
-    teste = rollback. Depois do teste: 1 Manter e sair | 2 Mudar de modo
-    e sair (testa antes) | 3 Voltar. O log fica sempre em C:\checkout\InstalaTLS.log.
+    teste = rollback. Depois do teste: 1 Mudar de modo (testa na hora) |
+    2 Voltar ao menu | 3 Deixar como está e sair. O log fica sempre em C:\checkout\InstalaTLS.log.
 
   Diferencas do Linux (o PDV Windows funciona de outro jeito):
     - Modo TLS = CONFITLS.INI presente em C:\checkout; GSurf = ausente
@@ -1842,7 +1842,7 @@ function Write-RodapeMenu([string]$k) {
 # |            confirma.
 # | Por quê:   Evita escolher errado por engano: só avança com confirmação.
 # +--------------------------------------------------------------------------+
-function Ask-Escolha([string[]]$opcoes) {
+function Ask-Escolha([string[]]$opcoes, [string]$Esc = '') {
     $validas = @()
     $textos = @()
     foreach ($o in $opcoes) {
@@ -1861,6 +1861,10 @@ function Ask-Escolha([string[]]$opcoes) {
         if ($tecla.Key -eq 'Enter') {
             Write-Log ('UI_OPCAO={0}' -f $validas[$sel])
             return $validas[$sel]
+        }
+        if ($Esc -and $tecla.Key -eq 'Escape') {
+            Write-Log ('UI_OPCAO={0} (Esc)' -f $Esc)
+            return $Esc
         }
         $novo = $sel
         if ($tecla.Key -eq 'UpArrow') { $novo = ($sel - 1 + $n) % $n }
@@ -1961,9 +1965,26 @@ function Invoke-FalhaAcao([string]$msg) {
 }
 
 # +--------------------------------------------------------------------------+
+# | DICA PARA CADA FALHA DE COMUNICAÇÃO
+# | O que faz: Diz, em uma frase, o que conferir quando o teste TLS ou GSurf
+# |            falha, conforme a mensagem recebida.
+# | Por quê:   O operador sabe o que corrigir sem consultar o suporte.
+# +--------------------------------------------------------------------------+
+function Get-DicaFalha([string]$modo, [string]$msg) {
+    if ($modo -eq 'TLS') {
+        if ($msg -match 'recusou|não iniciou|Erro na CliSiTef') { return 'Feche o Checkout e confira a CliSiTef32I.dll em C:\checkout; depois teste de novo.' }
+        if ($msg -match 'token|Token|registro|Registro') { return 'Confira o token TLS com a Fiserv e cadastre de novo (opção 1 - Cadastrar TLS).' }
+        return 'Confira a internet do PDV e a liberação de saída para tls-prod.fiservapp.com na porta 443; se estiver liberado, confira o token (opção 1).'
+    }
+    $d = 'Confira se o serviço GSurf (sitef) está rodando e se o certificado foi instalado (opção 2 - Instalar GSurf).'
+    if ($msg -match 'conex|Conex|tempo esgotado') { $d += ' ' + $GSURF_FIREWALL }
+    return $d
+}
+
+# +--------------------------------------------------------------------------+
 # | MOSTRAR O RESULTADO
-# | O que faz: Mostra se a comunicação deu OK ou falhou, com o motivo, e abre
-# |            o menu pós-teste.
+# | O que faz: Mostra se a comunicação deu OK ou falhou (com o motivo e a dica
+# |            em amarelo) e abre o menu depois do teste.
 # | Por quê:   O operador decide o próximo passo sabendo o resultado.
 # +--------------------------------------------------------------------------+
 function Show-Resultado([string]$modo, $r) {
@@ -1982,7 +2003,10 @@ function Show-Resultado([string]$modo, $r) {
     Write-Log ('RESULTADO_FINAL: modo={0} ok={1} msg={2}' -f $modo, $ok, $m)
     Write-Titulo ('Resultado | ' + (Get-NomeModo $modo))
     if ($ok) { Show-Mensagem ('Comunicação OK | ' + $m) 'ok' }
-    else { Show-Mensagem ('Falha na comunicação | ' + $m) 'erro' }
+    else {
+        Show-Mensagem ('Falha no teste de comunicação ' + (Get-NomeModo $modo) + ' | ' + $m) 'erro'
+        Write-Linhas (Get-DicaFalha $modo $m) 'Yellow'
+    }
     Invoke-PosTeste $modo
 }
 
@@ -2020,8 +2044,8 @@ function Exit-Final {
 
 # +--------------------------------------------------------------------------+
 # | MENU DEPOIS DO TESTE
-# | O que faz: Oferece: manter o modo e sair, mudar de modo (testando antes)
-# |            ou voltar.
+# | O que faz: Oferece: 1 mudar para o outro modo (testando antes), 2 voltar
+# |            ao menu inicial ou 3 deixar como está e sair.
 # | Por quê:   Decisão final do operador sobre o modo do PDV.
 # +--------------------------------------------------------------------------+
 function Invoke-PosTeste([string]$modo) {
@@ -2029,19 +2053,31 @@ function Invoke-PosTeste([string]$modo) {
     if ($modo -ne 'TLS') { $outro = 'TLS' }
     while ($true) {
         Write-Host ''
-        $e = Ask-Escolha @(('1:Manter {0} e sair' -f (Get-NomeModo $modo)), ('2:Mudar para {0} e sair' -f (Get-NomeModo $outro)), '3:Voltar')
-        if ($e -eq '1') { if (Set-ModoFinal $modo) { Exit-Final } }
-        if ($e -eq '2') { Invoke-Mudar $modo $outro }
-        if ($e -eq '3') { return }
+        $e = Ask-Escolha @(('1:Mudar para {0}' -f (Get-NomeModo $outro)), '2:Voltar para o menu inicial', ('3:Deixar como {0} e sair' -f (Get-NomeModo $modo)))
+        if ($e -eq '1') { Invoke-Mudar $modo $outro; return }
+        if ($e -eq '2') { return }
+        if ($e -eq '3') { if (Set-ModoFinal $modo) { Exit-Final } }
     }
 }
 
-# Muda de modo testando antes. OK = sai. Falha = pergunta se volta ao modo anterior.
+# +--------------------------------------------------------------------------+
+# | MENU FINAL
+# | O que faz: Depois de mudar de modo: 1 volta ao menu principal; 2 (ou Esc)
+# |            sai.
+# | Por quê:   Fechamento rápido depois que o PDV já está no modo certo.
+# +--------------------------------------------------------------------------+
+function Invoke-MenuFinal {
+    Write-Host ''
+    $e = Ask-Escolha @('1:Voltar para o menu principal', '2:Sair [ou pressione Esc]') '2'
+    if ($e -eq '2') { Exit-Final }
+}
+
 # +--------------------------------------------------------------------------+
 # | MUDAR DE MODO COM TESTE
-# | O que faz: Monta o outro modo e testa; se passar, sai; se falhar,
-# |            pergunta se volta ao anterior.
-# | Por quê:   Nunca troca de modo sem provar que funciona.
+# | O que faz: Monta o outro modo e testa na hora. Se passar, avisa que o PDV
+# |            está no modo novo. Se falhar, diz onde falhou, dá a dica e
+# |            volta sozinho para o modo que estava funcionando.
+# | Por quê:   O PDV nunca fica num modo que não comunica.
 # +--------------------------------------------------------------------------+
 function Invoke-Mudar([string]$de, [string]$para) {
     if (-not (Confirm-CaixaFechado)) { return }
@@ -2050,35 +2086,36 @@ function Invoke-Mudar([string]$de, [string]$para) {
     $script:Rotulo = 'Testando a comunicação ({0})' -f (Get-NomeModo $para)
     Start-Progresso ('Mudar para ' + (Get-NomeModo $para))
     Set-Progresso 10 ('Montando ambiente ' + (Get-NomeModo $para))
+    $etapa = ''; $m = ''
     try {
         if ($para -eq 'TLS') { Mount-Tls } else { Switch-Gsurf }
     } catch {
-        $e = Get-MsgErro $_
-        Close-Progresso
-        Show-Mensagem ('Falha ao montar o ambiente {0}: {1}' -f (Get-NomeModo $para), $e) 'erro'
-        [void](Set-ModoFinal $de)
-        return
+        $etapa = 'montar o ambiente ' + (Get-NomeModo $para)
+        $m = Get-MsgErro $_
     }
-    $r = Invoke-TesteSiTef $para 20 90
-    if ($r.Cancelado) { Stop-Cancelado }
-    Set-Progresso 100 $script:Rotulo
+    if (-not $etapa) {
+        $r = Invoke-TesteSiTef $para 20 90
+        if ($r.Cancelado) { Stop-Cancelado }
+        Set-Progresso 100 $script:Rotulo
+        if ($r.Codigo -ne 0) {
+            $etapa = 'teste de comunicação ' + (Get-NomeModo $para)
+            $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
+        }
+    }
     Close-Progresso
-    if ($r.Codigo -eq 0) {
+    if (-not $etapa) {
         Write-Log ('RESULTADO_FINAL: modo={0} ok=True (mudanca)' -f $para)
-        Show-Mensagem 'Comunicação OK | Servidor Ativo' 'ok'
-        Exit-Final
-    }
-    $m = $r.Util; if (-not $m) { $m = $r.Msg }; if (-not $m) { $m = 'Sem retorno' }
-    Write-Log ('RESULTADO_FINAL: modo={0} ok=False msg={1} (mudanca)' -f $para, $m)
-    Show-Mensagem ('Falha na comunicação em {0} | {1}' -f (Get-NomeModo $para), $m) 'erro'
-    Write-Host ''
-    Write-Linhas ('Deseja manter como {0}?' -f (Get-NomeModo $de)) 'White'
-    $e = Ask-Escolha @(('1:Sim, manter {0}' -f (Get-NomeModo $de)), ('2:Não, ficar em {0}' -f (Get-NomeModo $para)))
-    if ($e -eq '1') {
-        if (Set-ModoFinal $de) { Exit-Final }
+        Show-Mensagem ('PDV em modo de comunicação {0}. Testes realizados com sucesso.' -f (Get-NomeModo $para)) 'ok'
+        Invoke-MenuFinal
         return
     }
-    Exit-Final
+    Write-Log ('RESULTADO_FINAL: modo={0} ok=False etapa={1} msg={2} (mudanca)' -f $para, $etapa, $m)
+    Show-Mensagem ('Falha ao mudar para {0} | Onde: {1} | {2}' -f (Get-NomeModo $para), $etapa, $m) 'erro'
+    Write-Linhas (Get-DicaFalha $para $m) 'Yellow'
+    if (Set-ModoFinal $de) {
+        Show-Mensagem ('PDV mantido em modo de comunicação {0}, que está funcionando.' -f (Get-NomeModo $de)) 'aviso'
+    }
+    Invoke-MenuFinal
 }
 
 # =========================================================
@@ -2513,11 +2550,12 @@ function Invoke-InstalarGsurf {
 
     $rc = Install-CertificadoGsurf
     if ($rc -eq 0) {
-        Show-Mensagem 'GSurf instalado. Use a opção 4 para testar.' 'ok'
-    } else {
-        Show-Mensagem ('O instalador do certificado terminou com código {0}.' -f $rc) 'erro'
-        Write-Linhas 'Confira a mensagem acima (login, senha ou OTP) e rode Instalar GSurf de novo.' 'Yellow'
+        Show-Mensagem 'GSurf instalado. Testando a comunicação...' 'ok'
+        Invoke-TestarGsurf
+        return
     }
+    Show-Mensagem ('O instalador do certificado terminou com código {0}.' -f $rc) 'erro'
+    Write-Linhas 'Confira a mensagem acima (login, senha ou OTP) e rode Instalar GSurf de novo.' 'Yellow'
     Wait-Enter
 }
 

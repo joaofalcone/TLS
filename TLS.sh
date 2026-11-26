@@ -546,6 +546,12 @@ ui_opcao(){
         $'\e')
           rest=""
           IFS= read -rsn2 -t 0.1 rest <&4 || true
+          if [[ -z "$rest" && -n "${UI_ESC:-}" ]]; then
+            for (( i=0; i<${#_MK[@]}; i++ )); do
+              if [[ "${_MK[i]}" == "$UI_ESC" ]]; then _MSEL=$i; fi
+            done
+            break
+          fi
           if [[ "$rest" == "[A" ]]; then _MSEL=$(( (_MSEL - 1 + ${#_MK[@]}) % ${#_MK[@]} )); fi
           if [[ "$rest" == "[B" ]]; then _MSEL=$(( (_MSEL + 1) % ${#_MK[@]} )); fi
           ;;
@@ -2789,10 +2795,29 @@ acao_falhou(){
   ui_pausa
 }
 
-# Mostra o resultado do teste e o menu pós-teste.
+# +--------------------------------------------------------------------------+
+# | DICA PARA CADA FALHA DE COMUNICAÇÃO
+# | O que faz: Diz, em uma frase, o que conferir quando o teste TLS ou GSurf
+# |            falha, conforme a mensagem recebida.
+# | Por quê:   O operador sabe o que corrigir sem consultar o suporte.
+# +--------------------------------------------------------------------------+
+dica_falha(){
+  local modo="$1" msg="${2:-}"
+  if [[ "$modo" == "TLS" ]]; then
+    case "$msg" in
+      *[Ss]ocket*|*configurar*|*iniciar*) printf '%s' "Confira o serviço do TEF (systemctl status ${SERVICE_NAME}) e teste de novo." ;;
+      *[Tt]oken*|*[Rr]egistro*) printf '%s' "Confira o token TLS com a Fiserv e cadastre de novo (opção 1 - Cadastrar TLS)." ;;
+      *) printf '%s' "Confira a internet do PDV e a liberação de saída para tls-prod.fiservapp.com na porta 443; se estiver liberado, confira o token (opção 1)." ;;
+    esac
+    return 0
+  fi
+  printf '%s' "Confira o serviço ${GSURF_SERVICO} (systemctl status ${GSURF_SERVICO}) e, se preciso, rode a opção 2 - Instalar GSurf."
+}
+
 # +--------------------------------------------------------------------------+
 # | MOSTRAR O RESULTADO
-# | O que faz: Mostra OK ou falha e abre o menu pós-teste.
+# | O que faz: Mostra OK ou falha (com o motivo e a dica em amarelo) e abre o
+# |            menu depois do teste.
 # | Por quê:   O operador decide o próximo passo sabendo o resultado.
 # +--------------------------------------------------------------------------+
 fim_teste(){
@@ -2804,7 +2829,8 @@ fim_teste(){
   if [[ "$ok" == "1" ]]; then
     ui_ok "Comunicação OK | ${msg:-Servidor Ativo}"
   else
-    ui_erro "Falha na comunicação | ${msg:-Sem retorno}"
+    ui_erro "Falha no teste de comunicação $(nome_modo "$modo") | ${msg:-Sem retorno}"
+    ui_aviso "$(dica_falha "$modo" "$msg")"
   fi
   pos_teste "$modo"
 }
@@ -2857,8 +2883,8 @@ sair(){
 
 # +--------------------------------------------------------------------------+
 # | MENU DEPOIS DO TESTE
-# | O que faz: Manter o modo e sair, mudar de modo (testando antes) ou
-# |            voltar.
+# | O que faz: Oferece: 1 mudar para o outro modo (testando na hora), 2 voltar
+# |            ao menu inicial ou 3 deixar como está e sair.
 # | Por quê:   Decisão final do operador.
 # +--------------------------------------------------------------------------+
 pos_teste(){
@@ -2866,24 +2892,38 @@ pos_teste(){
   if [[ "$modo" == "TLS" ]]; then outro="GSURF"; else outro="TLS"; fi
   while true; do
     ui_out '\n'
-    op="$(ui_opcao "1:Manter $(nome_modo "$modo") e sair" "2:Mudar para $(nome_modo "$outro") e sair" "3:Voltar")"
+    op="$(ui_opcao "1:Mudar para $(nome_modo "$outro")" "2:Voltar para o menu inicial" "3:Deixar como $(nome_modo "$modo") e sair")"
     case "$op" in
-      1) if [[ "$modo" == "TLS" ]]; then manter_tls && sair; else manter_gsurf && sair; fi ;;
-      2) mudar_modo "$modo" "$outro" ;;
-      3) return 0 ;;
+      1) mudar_modo "$modo" "$outro"; return 0 ;;
+      2) return 0 ;;
+      3) if [[ "$modo" == "TLS" ]]; then manter_tls && sair; else manter_gsurf && sair; fi ;;
     esac
   done
 }
 
-# Muda de modo testando antes. OK = sai. Falha = pergunta se volta ao anterior.
+# +--------------------------------------------------------------------------+
+# | MENU FINAL
+# | O que faz: Depois de mudar de modo: 1 volta ao menu principal; 2 (ou Esc)
+# |            sai.
+# | Por quê:   Fechamento rápido depois que o PDV já está no modo certo.
+# +--------------------------------------------------------------------------+
+menu_final(){
+  local op
+  ui_out '\n'
+  op="$(UI_ESC=2 ui_opcao "1:Voltar para o menu principal" "2:Sair [ou pressione Esc]")"
+  if [[ "$op" == "2" ]]; then sair; fi
+  return 0
+}
+
 # +--------------------------------------------------------------------------+
 # | MUDAR DE MODO COM TESTE
-# | O que faz: Monta o outro modo e testa; se falhar, pergunta se volta ao
-# |            anterior.
-# | Por quê:   Nunca troca de modo sem provar que funciona.
+# | O que faz: Monta o outro modo e testa na hora. Se passar, avisa que o PDV
+# |            está no modo novo. Se falhar, diz onde falhou, dá a dica e
+# |            volta sozinho para o modo que estava funcionando.
+# | Por quê:   O PDV nunca fica num modo que não comunica.
 # +--------------------------------------------------------------------------+
 mudar_modo(){
-  local de="$1" para="$2" ok=0 msg="" op
+  local de="$1" para="$2" ok=0 msg="" etapa=""
   log_sep
   log "MUDAR_MODO: ${de} -> ${para}"
   nova_acao "mudar_${para}"
@@ -2891,21 +2931,20 @@ mudar_modo(){
   if [[ "$para" == "TLS" ]]; then
     step_collect_existing_token >>"$AUDIT_TMP" 2>&1 || true
     if [[ -z "${TOKEN_ATUAL_BANCO:-}" ]]; then
-      ui_erro "Nenhum token cadastrado para este caixa. Use Cadastrar TLS."
-      return 0
+      etapa="montar o ambiente TLS"; msg="nenhum token cadastrado para este caixa"
+    else
+      TOKEN_TLS="$TOKEN_ATUAL_BANCO"
+      UI_TEST_LABEL="Testando comunicação TLS"
+      ui_start "Mudar para TLS"
+      ui_progress 8 "Montando ambiente TLS"
+      if ! ui_step_min "Montando ambiente TLS" step_prepare_tls_for_existing_token_test; then
+        etapa="montar o ambiente TLS"; msg="falha ao gravar ou reiniciar o serviço do TEF"
+      elif ui_step_min "Testando comunicação TLS" run_integrated_tls_test 20; then
+        ok=1
+      else
+        etapa="teste de comunicação TLS"; msg="${TEST_RESULT_MSG:-Sem retorno}"
+      fi
     fi
-    TOKEN_TLS="$TOKEN_ATUAL_BANCO"
-    UI_TEST_LABEL="Testando comunicação TLS"
-    ui_start "Mudar para TLS"
-    ui_progress 8 "Montando ambiente TLS"
-    if ! ui_step_min "Montando ambiente TLS" step_prepare_tls_for_existing_token_test; then
-      ui_finish_progress
-      ui_erro "Falha ao montar o ambiente TLS."
-      manter_gsurf || true
-      return 0
-    fi
-    if ui_step_min "Testando comunicação TLS" run_integrated_tls_test 20; then ok=1; fi
-    msg="${TEST_RESULT_MSG:-Sem retorno}"
   else
     step_collect_existing_token >>"$AUDIT_TMP" 2>&1 || true
     TOKEN_TLS="${TOKEN_ATUAL_BANCO:-GSURF}"
@@ -2913,32 +2952,32 @@ mudar_modo(){
     ui_start "Mudar para GSurf"
     ui_progress 10 "Montando ambiente GSurf"
     if ! ui_step_min "Montando ambiente GSurf" step_switch_to_gsurf; then
-      ui_finish_progress
-      ui_erro "Falha ao montar o ambiente GSurf."
-      manter_tls || true
-      return 0
+      etapa="montar o ambiente GSurf"; msg="falha ao gravar ou reiniciar o serviço do TEF"
+    else
+      ui_progress 20 "Testando comunicação GSurf"
+      ui_step_min "Testando comunicação GSurf" step_validate_final_mode GSURF || true
+      if [[ "${FINAL_MODE_TEST_OK:-0}" == "1" ]]; then ok=1
+      else etapa="teste de comunicação GSurf"; msg="${FINAL_MODE_TEST_MSG:-Sem retorno}"; fi
     fi
-    ui_progress 20 "Testando comunicação GSurf"
-    ui_step_min "Testando comunicação GSurf" step_validate_final_mode GSURF || true
-    ok="${FINAL_MODE_TEST_OK:-0}"
-    msg="${FINAL_MODE_TEST_MSG:-Sem retorno}"
   fi
   ui_finish_progress
-  log "RESULTADO_FINAL: modo=${para} ok=${ok} msg=${msg} (mudanca)"
+  log "RESULTADO_FINAL: modo=${para} ok=${ok} etapa=${etapa} msg=${msg} (mudanca)"
 
   if [[ "$ok" == "1" ]]; then
-    ui_ok "Comunicação OK | ${msg}"
-    sair
-  fi
-
-  ui_erro "Falha na comunicação em $(nome_modo "$para") | ${msg}"
-  ui_out '\n  Deseja manter como %s?\n' "$(nome_modo "$de")"
-  op="$(ui_opcao "1:Sim, manter $(nome_modo "$de")" "2:Não, ficar em $(nome_modo "$para")")"
-  if [[ "$op" == "1" ]]; then
-    if [[ "$de" == "TLS" ]]; then manter_tls && sair; else manter_gsurf && sair; fi
+    ui_ok "PDV em modo de comunicação $(nome_modo "$para"). Testes realizados com sucesso."
+    menu_final
     return 0
   fi
-  sair
+
+  ui_erro "Falha ao mudar para $(nome_modo "$para") | Onde: ${etapa} | ${msg}"
+  ui_aviso "$(dica_falha "$para" "$msg")"
+  if [[ "$de" == "TLS" ]]; then
+    if manter_tls; then ui_aviso "PDV mantido em modo de comunicação TLS, que está funcionando."; fi
+  else
+    if manter_gsurf; then ui_aviso "PDV mantido em modo de comunicação GSurf, que está funcionando."; fi
+  fi
+  menu_final
+  return 0
 }
 
 # =========================================================
@@ -3001,12 +3040,13 @@ acao_instalar_gsurf(){
   fi
   sleep 1
   if systemctl is-active --quiet "$GSURF_SERVICO"; then
-    ui_ok "GSurf instalado e ${GSURF_SERVICO} ativo. Use a opção 4 para testar."
-  else
-    systemctl status "$GSURF_SERVICO" --no-pager >>"$AUDIT_TMP" 2>&1 || true
-    ui_erro "O serviço ${GSURF_SERVICO} não ficou ativo."
-    ui_aviso "Veja: systemctl status ${GSURF_SERVICO}"
+    ui_ok "GSurf instalado e ${GSURF_SERVICO} ativo. Testando a comunicação..."
+    acao_testar_gsurf
+    return 0
   fi
+  systemctl status "$GSURF_SERVICO" --no-pager >>"$AUDIT_TMP" 2>&1 || true
+  ui_erro "O serviço ${GSURF_SERVICO} não ficou ativo."
+  ui_aviso "Veja: systemctl status ${GSURF_SERVICO}"
   ui_pausa
 }
 
