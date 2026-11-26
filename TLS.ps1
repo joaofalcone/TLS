@@ -2802,6 +2802,8 @@ function Open-CredAuto {
     Write-Host '  InstalaTLS - automático (GSurf + TLS)' -ForegroundColor White
     # Nome diferente de $Cred: no PowerShell maiúscula/minúscula é a mesma variável.
     $script:CredAberta = $null
+    # Bloco gerado sem PIN (uso pessoal): abre direto, sem perguntar nada.
+    try { $script:CredAberta = Unprotect-CredAuto $Cred '' } catch { }
     for ($t = 1; $t -le 3 -and -not $script:CredAberta; $t++) {
         $pin = Read-Senha 'PIN:'
         try { $script:CredAberta = Unprotect-CredAuto $Cred $pin } catch { Write-Log ('PIN_RECUSADO: ' + (Get-MsgErro $_)); Write-Host '  PIN incorreto.' -ForegroundColor Red }

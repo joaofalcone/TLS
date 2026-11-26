@@ -3256,7 +3256,11 @@ modo_auto(){
   ui_out '\n  %sInstalaTLS - automático (GSurf + TLS)%s\n' "$C_TIT" "$C_RST"
   if ! command -v openssl >/dev/null 2>&1; then ui_erro "ERRO: openssl não encontrado neste PDV."; exit 1; fi
 
+  # Bloco gerado sem PIN (uso pessoal): abre direto, sem perguntar nada.
+  cred="$(printf '%s' "$AUTO_CRED" | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$AUTO_ITER" -md sha1 -a -A -pass fd:3 3<<<"" 2>/dev/null || true)"
+  [[ "${cred%%$'\n'*}" == "TLS1" ]] || cred=""
   for t in 1 2 3; do
+    [[ -z "$cred" ]] || break
     ui_out '  %sPIN:%s ' "$C_PER" "$C_RST"
     local pin; pin="$(ler_oculto)"; ui_out '\n'
     cred="$(printf '%s' "$AUTO_CRED" | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$AUTO_ITER" -md sha1 -a -A -pass fd:3 3<<<"$pin" 2>/dev/null || true)"
