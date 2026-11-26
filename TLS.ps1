@@ -121,6 +121,26 @@ public static class TlsNat
         if (p == IntPtr.Zero) throw new Exception("Funcao " + nome + " ausente na DLL");
         return Marshal.GetDelegateForFunctionPointer(p, tipo);
     }
+
+    // Sair na hora: o fim normal do processo descarrega as DLLs nativas
+    // (MySQL), o que às vezes demora e parece travado. Encerrar direto pula isso.
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    static extern bool TerminateProcess(IntPtr processo, uint codigo);
+    public static void Encerrar(int codigo) { TerminateProcess(GetCurrentProcess(), (uint)codigo); }
+
+    // Clique no X da janela (2), logoff (5) ou desligamento (6): fecha na hora.
+    public delegate bool TratadorConsole(int tipo);
+    static TratadorConsole tratador;
+    [DllImport("kernel32.dll")]
+    static extern bool SetConsoleCtrlHandler(TratadorConsole t, bool adicionar);
+    public static void VigiarFechamento()
+    {
+        if (tratador != null) return;
+        tratador = delegate(int tipo) { if (tipo == 2 || tipo == 5 || tipo == 6) Encerrar(1); return false; };
+        SetConsoleCtrlHandler(tratador, true);
+    }
 }
 
 public class TlsMyDb
@@ -1339,6 +1359,7 @@ function Complete-Log {
 # +--------------------------------------------------------------------------+
 function Exit-Script([int]$codigo) {
     Close-Progresso
+    Write-Host '  Encerrando...' -ForegroundColor DarkGray
     try { if ($script:Db) { $script:Db.Fechar() } } catch { }
     $script:DbSenha = $null
     $script:TokenTls = $null
@@ -1351,7 +1372,9 @@ function Exit-Script([int]$codigo) {
     $script:Saindo = $true
     Write-Host ''
     try { [void](Read-Host '  Pressione Enter para fechar') } catch { }
-    exit $codigo
+    # Tudo já foi limpo: sai direto, sem esperar o PowerShell desmontar a sessão.
+    try { [TlsNat]::Encerrar($codigo) } catch { }
+    [Environment]::Exit($codigo)
 }
 
 # +--------------------------------------------------------------------------+
@@ -3012,12 +3035,18 @@ Write-Host ''
 Write-Host '  InstalaTLS - PDV Windows' -ForegroundColor White
 Write-Dica ('Checkout: {0}' -f $CheckoutDir)
 Write-Dica 'Ctrl+C cancela a qualquer momento.'
+try { Import-Nativo; [TlsNat]::VigiarFechamento() } catch { }
 
 # Temporários (backup do CONFITLS.INI com token, status do teste, pacote/MSI/MST
 # da GSurf executados como administrador): nome aleatório (não dá para plantar
 # antes) dentro da pasta protegida; sem ela, em %TEMP% com ACL só de administradores.
 $seg = Get-PastaSegura
 if ($seg) {
+    # Sobras de uma janela fechada no X (sai na hora, sem limpar). A trava acima
+    # garante que nenhuma outra execução está usando essas pastas.
+    foreach ($velha in @(Get-ChildItem -LiteralPath $seg -Filter 'run_*' -ErrorAction SilentlyContinue)) {
+        try { Remove-Item -LiteralPath $velha.FullName -Recurse -Force -ErrorAction Stop } catch { }
+    }
     $script:TmpDir = Join-Path $seg ('run_' + [Guid]::NewGuid().ToString('N'))
     [void][IO.Directory]::CreateDirectory($script:TmpDir)
 } else {
