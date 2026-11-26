@@ -465,7 +465,7 @@ function Import-Nativo {
 # +--------------------------------------------------------------------------+
 function Write-Log([string]$m) {
     if (-not $script:Audit) { return }
-    $linha = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
+    $linha = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $m
     try { [IO.File]::AppendAllText($script:Audit, $linha + "`r`n", [Text.Encoding]::UTF8) } catch { }
 }
 
@@ -850,20 +850,26 @@ function Invoke-ModoTeste {
         Import-Nativo
         [Environment]::CurrentDirectory = $CheckoutDir
         Set-Location -LiteralPath $CheckoutDir
+        # ETAPA|nome: marcos reais do teste. A tela principal anda a barra entre
+        # um marco e outro pelo tempo que cada etapa costuma levar.
+        Write-Status 'ETAPA|pronto'
         Write-Status ('PCT|{0}' -f $PctIni)
         Write-Status ('LOG|MODO={0} DLL={1}' -f $Modo, $SITEF_DLL)
         $s = New-Object TlsSiTef -ArgumentList $SITEF_DLL
+        Write-Status 'ETAPA|dll'
 
         Write-Status ('LOG|CONFIGURA ip={0} idLoja={1} idTerminal={2} parms={3}' -f $IpSiTef, $IdLoja, $IdTerm, $Parms)
         $r = $s.Configurar($IpSiTef, $IdLoja, $IdTerm, $Parms)
         Write-Status ('LOG|CONFIGURA_RESULT={0}' -f $r)
         if ($r -ne 0) { return (Send-Resultado 11 ('A CliSiTef recusou a configuração (retorno {0})' -f $r)) }
+        Write-Status 'ETAPA|configurado'
         $base = $PctIni + 5
         Write-Status ('PCT|{0}' -f $base)
 
         $iniciou = $true
         $r = $s.Iniciar(110, '0', $cupom, $data, $hora, $OPERADOR, '{DevolveStringQRCode=1}')
         Write-Status ('LOG|INICIA_RESULT={0}' -f $r)
+        Write-Status 'ETAPA|iniciado'
         if ($r -eq 0) {
             $s.Finalizar(1, $cupom, $data, $hora)
             return (Send-Resultado 0 'Servidor Ativo')
@@ -915,16 +921,19 @@ function Invoke-ModoTeste {
 
                 if (-not $selecionou -and $msg -match '1:Teste de comunicacao') {
                     Write-Status 'LOG|DECISAO: menu Teste de comunicacao (opcao 1)'
+                    Write-Status 'ETAPA|menu'
                     $resp = '1'; $selecionou = $true
                     continue
                 }
                 if ($msg -match '^Confirma o teste de comunicacao .*fiservapp\.com') {
                     Write-Status 'LOG|MARCO: confirmacao do teste TLS (opcao 0)'
+                    Write-Status 'ETAPA|confirmado'
                     $resp = '0'
                     continue
                 }
                 if ($msg -match '^Confirma o teste de comunicacao .*127\.0\.0\.1') {
                     Write-Status 'LOG|MARCO: confirmacao do teste GSURF (opcao 0)'
+                    Write-Status 'ETAPA|confirmado'
                     $resp = '0'
                     continue
                 }
@@ -1233,6 +1242,7 @@ function Start-Progresso([string]$titulo) {
     $script:UltMsgTela = ''
     $script:UltPctTela = -1
     $script:BarraNaTela = $false
+    Reset-MedicaoBarra
     Write-Titulo $titulo
     Write-Dica 'Ctrl+C cancela e restaura a configuração anterior.'
 }
@@ -1312,22 +1322,108 @@ function Clear-Barra {
 # Espera um processo andando a barra sozinha (curva que desacelera e nunca
 # chega ao fim antes do processo terminar): sem isso a barra parava minutos
 # no mesmo ponto e parecia travada. Devolve $false se estourar o tempo.
-function Wait-Processo($p, [int]$timeoutMs, [int]$estSeg) {
+# Fração (0 a 1) de uma etapa pelo tempo: anda em ritmo constante até 90% no
+# tempo esperado e, se a etapa demorar mais, continua andando cada vez mais
+# devagar sem nunca chegar ao fim. Com o tempo certo, o salto no fim é pequeno.
+function Get-Curva([double]$t, [double]$est) {
+    if ($est -lt 0.2) { $est = 0.2 }
+    if ($t -le 0) { return 0.0 }
+    if ($t -lt $est) { return 0.9 * $t / $est }
+    return 0.9 + 0.1 * (1 - [Math]::Exp(-($t - $est) / $est))
+}
+
+# Tempos aprendidos: quanto cada etapa levou neste PDV (média com as vezes
+# anteriores), guardados na pasta protegida. A barra usa esse tempo na
+# próxima vez e fica fiel ao PDV (rede, disco e CliSiTef de cada loja).
+function Get-TempoAprendido([string]$chave, [double]$padrao) {
+    if ($null -eq $script:Tempos) {
+        $script:Tempos = @{}
+        try {
+            $arq = Join-Path (Get-PastaSegura) 'tempos_barra.txt'
+            foreach ($l in [IO.File]::ReadAllLines($arq)) {
+                $p = $l.Split('=')
+                if ($p.Count -eq 2) { $script:Tempos[$p[0]] = [double]::Parse($p[1], [Globalization.CultureInfo]::InvariantCulture) }
+            }
+        } catch { }
+    }
+    if ($chave -and $script:Tempos.ContainsKey($chave)) { return $script:Tempos[$chave] }
+    return $padrao
+}
+
+function Save-TempoAprendido([string]$chave, [double]$seg) {
+    if (-not $chave -or $seg -le 0) { return }
+    $antes = Get-TempoAprendido $chave -1
+    $novo = $seg
+    if ($antes -gt 0) { $novo = ($antes + $seg) / 2 }
+    $script:Tempos[$chave] = [Math]::Round($novo, 2)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    Write-Log ('BARRA_APRENDIDO {0} medido={1}s antes={2}s agora={3}s' -f $chave, $seg.ToString('0.00', $inv), $antes.ToString('0.00', $inv), $script:Tempos[$chave].ToString('0.00', $inv))
+    try {
+        $arq = Join-Path (Get-PastaSegura) 'tempos_barra.txt'
+        $linhas = @($script:Tempos.Keys | Sort-Object | ForEach-Object { $_ + '=' + $script:Tempos[$_].ToString($inv) })
+        [IO.File]::WriteAllLines($arq, [string[]]$linhas)
+    } catch { }
+}
+
+# Espera algo terminar andando a barra sozinha até $script:PctAte (sem isso a
+# barra parava minutos no mesmo ponto e parecia travada). $terminou é chamado
+# a cada ~100 ms e devolve $true quando acabou. Devolve $false se estourar o
+# tempo. $chave: nome para aprender quanto essa etapa leva neste PDV.
+function Wait-ComBarra([scriptblock]$terminou, [int]$timeoutMs, [double]$estSeg, [string]$chave) {
     $de = $script:UltPctTela
     if ($de -lt 0) { $de = 0 }
     $ate = $script:PctAte
     if ($ate -le $de) { $ate = [Math]::Min($de + 15, 95) }
     $msg = $script:UltMsgTela
     if ($estSeg -lt 1) { $estSeg = 20 }
+    $est = Get-TempoAprendido $chave $estSeg
     $ini = [DateTime]::Now
-    while (-not $p.WaitForExit(250)) {
-        $ms = ([DateTime]::Now - $ini).TotalMilliseconds
-        if ($timeoutMs -gt 0 -and $ms -ge $timeoutMs) { return $false }
+    $ok = $true
+    while (-not (& $terminou)) {
+        $s = ([DateTime]::Now - $ini).TotalSeconds
+        if ($timeoutMs -gt 0 -and $s * 1000 -ge $timeoutMs) { $ok = $false; break }
         if ($script:ProgressoAtivo -and $msg) {
-            Set-Progresso ($de + [int](($ate - $de - 1) * (1 - [Math]::Exp(-$ms / 1000.0 / $estSeg)))) $msg
+            $v = $de + [int](($ate - $de - 1) * (Get-Curva $s $est))
+            if ($v -gt $script:UltPctTela) { Set-Progresso $v $msg }
         }
     }
-    return $true
+    $s = ([DateTime]::Now - $ini).TotalSeconds
+    Write-Log ('BARRA_ESPERA {0} ms={1} esperado={2}s ok={3} barra={4}%' -f $chave, [int]($s * 1000), $est, $ok, $script:UltPctTela)
+    if ($ok) { Save-TempoAprendido $chave $s }
+    return $ok
+}
+
+function Wait-Processo($p, [int]$timeoutMs, [int]$estSeg, [string]$chave) {
+    return (Wait-ComBarra ({ $p.WaitForExit(100) }.GetNewClosure()) $timeoutMs $estSeg $chave)
+}
+
+# Roda um comando demorado (reiniciar serviço, baixar arquivo) em paralelo e
+# anda a barra enquanto espera. Erro do comando volta como exceção.
+function Invoke-ComBarra([scriptblock]$comando, [object[]]$argumentos, [int]$timeoutMs, [double]$estSeg, [string]$chave) {
+    $ps = [PowerShell]::Create()
+    [void]$ps.AddScript($comando.ToString())
+    foreach ($a in $argumentos) { [void]$ps.AddArgument($a) }
+    $h = $ps.BeginInvoke()
+    $ok = Wait-ComBarra ({ $h.AsyncWaitHandle.WaitOne(100) }.GetNewClosure()) $timeoutMs $estSeg $chave
+    if (-not $ok) { throw ('tempo esgotado ({0} s)' -f [int]($timeoutMs / 1000)) }
+    try {
+        $r = $ps.EndInvoke($h)
+        if ($ps.Streams.Error.Count -gt 0) { throw $ps.Streams.Error[0].Exception }
+        return $r
+    } finally { $ps.Dispose() }
+}
+
+# Medição da barra para o log: tempo de cada etapa, maior parada (tempo sem a
+# porcentagem mudar) e maior salto. É o que mostra onde a barra ainda trava.
+function Reset-MedicaoBarra {
+    $script:BarraIni = [DateTime]::Now
+    $script:BarraUltMud = $script:BarraIni
+    $script:EtapaIni = $script:BarraIni
+    $script:BarraMaxParada = 0
+    $script:BarraParadaEm = ''
+    $script:BarraMaxSalto = 0
+    $script:BarraSaltoEm = ''
+    $script:BarraMudancas = 0
 }
 
 function Set-Progresso([int]$pct, [string]$msg) {
@@ -1335,10 +1431,25 @@ function Set-Progresso([int]$pct, [string]$msg) {
     if ($pct -lt 0) { $pct = 0 }
     if ($pct -gt 100) { $pct = 100 }
     if (-not $msg) { $msg = $script:Rotulo }
-    if ($msg -ne $script:UltMsgTela) { Clear-Barra; Write-Linhas ('> ' + $msg) 'Cyan'; $script:UltMsgTela = $msg }
-    if ($pct -ne $script:UltPctTela -or -not $script:BarraNaTela) { Write-Barra $pct $msg; $script:UltPctTela = $pct }
+    if ($null -eq $script:BarraIni) { Reset-MedicaoBarra }
+    $agora = [DateTime]::Now
+    if ($msg -ne $script:UltMsgTela) {
+        if ($script:UltMsgTela) { Write-Log ('BARRA_ETAPA_FIM "{0}" ms={1} barra={2}%' -f $script:UltMsgTela, [int]($agora - $script:EtapaIni).TotalMilliseconds, $script:UltPctTela) }
+        $script:EtapaIni = $agora
+        Clear-Barra; Write-Linhas ('> ' + $msg) 'Cyan'; $script:UltMsgTela = $msg
+    }
+    if ($pct -ne $script:UltPctTela -or -not $script:BarraNaTela) {
+        if ($pct -ne $script:UltPctTela) {
+            $parada = ($agora - $script:BarraUltMud).TotalMilliseconds
+            if ($parada -gt $script:BarraMaxParada) { $script:BarraMaxParada = $parada; $script:BarraParadaEm = '{0}% "{1}"' -f $script:UltPctTela, $msg }
+            if ($script:UltPctTela -ge 0 -and ($pct - $script:UltPctTela) -gt $script:BarraMaxSalto) { $script:BarraMaxSalto = $pct - $script:UltPctTela; $script:BarraSaltoEm = '{0}%->{1}% "{2}"' -f $script:UltPctTela, $pct, $msg }
+            $script:BarraUltMud = $agora
+            $script:BarraMudancas++
+        }
+        Write-Barra $pct $msg; $script:UltPctTela = $pct
+    }
     if ($pct -ne $script:UltPctLog -or $msg -ne $script:UltMsgLog) {
-        Write-Log ('UI_PROGRESS={0}% MSG={1}' -f $pct, $msg)
+        Write-Log ('UI_PROGRESS={0}% MSG={1} t={2}ms' -f $pct, $msg, [int]($agora - $script:BarraIni).TotalMilliseconds)
         $script:UltPctLog = $pct; $script:UltMsgLog = $msg
     }
 }
@@ -1351,6 +1462,12 @@ function Set-Progresso([int]$pct, [string]$msg) {
 function Close-Progresso {
     if (-not $script:ProgressoAtivo) { return }
     $script:ProgressoAtivo = $false
+    if ($null -ne $script:BarraIni) {
+        $agora = [DateTime]::Now
+        if ($script:UltMsgTela) { Write-Log ('BARRA_ETAPA_FIM "{0}" ms={1} barra={2}%' -f $script:UltMsgTela, [int]($agora - $script:EtapaIni).TotalMilliseconds, $script:UltPctTela) }
+        Write-Log ('BARRA_RESUMO duracao_ms={0} mudancas={1} maior_parada_ms={2} em {3} | maior_salto={4} pts em {5}' -f [int]($agora - $script:BarraIni).TotalMilliseconds, $script:BarraMudancas, [int]$script:BarraMaxParada, $script:BarraParadaEm, $script:BarraMaxSalto, $script:BarraSaltoEm)
+        $script:BarraIni = $null
+    }
     # Termina a linha da barra (fica visível no último valor) e libera a tela.
     if ($script:BarraNaTela) { Write-Host ''; $script:BarraNaTela = $false }
 }
@@ -1901,6 +2018,20 @@ function Invoke-TesteSiTef([string]$modo, [int]$pctIni, [int]$pctMax) {
     $script:ProcTeste = $p
     $script:CancelarArq = $cn
 
+    # Barra: anda sozinha entre os marcos reais (ETAPA) que o processo de teste
+    # avisa. Cada marco tem a fração da barra onde termina e o tempo esperado
+    # (padrão medido num PDV real; depois vale o tempo aprendido neste PDV).
+    # Começa de onde a barra está (sem salto) e nunca volta.
+    $inicio = $script:UltPctTela
+    if ($inicio -lt 0 -or $inicio -ge $pctMax) { $inicio = $pctIni }
+    $marcos = @(@('pronto', 0.18, 7), @('dll', 0.55, 15), @('configurado', 0.68, 5), @('iniciado', 0.72, 1), @('menu', 0.85, 6), @('confirmado', 0.88, 1), @('fim', 0.99, 3))
+    $mi = 0
+    $t0 = [DateTime]::Now
+    $segT0 = $t0
+    $segDe = $inicio
+    $mostrado = $inicio
+    Set-Progresso $mostrado $script:Rotulo
+
     $res = @{ Codigo = -1; Msg = ''; Util = ''; Ultima = ''; Cancelado = $false }
     $lidos = 0
     $fim = $false
@@ -1921,7 +2052,9 @@ function Invoke-TesteSiTef([string]$modo, [int]$pctIni, [int]$pctMax) {
                         foreach ($linha in ($txt.Substring(0, $ult + 1) -split "`r?`n")) {
                             if (-not $linha) { continue }
                             $pt = $linha.Split('|')
-                            if ($pt[0] -eq 'PCT') { Set-Progresso ([int]$pt[1]) $script:Rotulo }
+                            $marco = ''
+                            if ($pt[0] -eq 'PCT') { }
+                            elseif ($pt[0] -eq 'ETAPA') { $marco = $pt[1] }
                             elseif ($pt[0] -eq 'LOG') { Write-Log ('SITEF[{0}] {1}' -f $modo, $linha.Substring(4)) }
                             elseif ($pt[0] -eq 'RESULT') {
                                 $res.Codigo = [int]$pt[1]
@@ -1929,6 +2062,19 @@ function Invoke-TesteSiTef([string]$modo, [int]$pctIni, [int]$pctMax) {
                                 if ($pt.Count -gt 3) { $res.Util = $pt[3] }
                                 if ($pt.Count -gt 4) { $res.Ultima = $pt[4] }
                                 Write-Log ('SITEF[{0}] RESULT codigo={1} msg={2}' -f $modo, $res.Codigo, $res.Msg)
+                                $marco = 'fim'
+                            }
+                            if ($marco) {
+                                $k = $mi
+                                while ($k -lt $marcos.Count -and $marcos[$k][0] -ne $marco) { $k++ }
+                                if ($k -lt $marcos.Count) {
+                                    $agora = [DateTime]::Now
+                                    $segS = ($agora - $segT0).TotalSeconds
+                                    Write-Log ('BARRA_MARCO teste={0} marco={1} etapa_ms={2} total_ms={3} barra={4}%' -f $modo, $marco, [int]($segS * 1000), [int](($agora - $t0).TotalMilliseconds), $mostrado)
+                                    # Só aprende o tempo de etapa que veio na ordem (sem marco pulado).
+                                    if ($k -eq $mi -and $res.Codigo -le 0) { Save-TempoAprendido ('teste_{0}_{1}' -f $modo, $marco) $segS }
+                                    $mi = $k + 1; $segT0 = $agora; $segDe = $mostrado
+                                }
                             }
                         }
                     }
@@ -1936,8 +2082,15 @@ function Invoke-TesteSiTef([string]$modo, [int]$pctIni, [int]$pctMax) {
             } finally { $fs.Close() }
         } catch { }
 
-        if (-not $fim) { Start-Sleep -Milliseconds 150 }
+        if ($mi -lt $marcos.Count) {
+            $alvo = $inicio + ($pctMax - $inicio) * $marcos[$mi][1]
+            $est = Get-TempoAprendido ('teste_{0}_{1}' -f $modo, $marcos[$mi][0]) $marcos[$mi][2]
+            $v = [int]($segDe + ($alvo - $segDe) * (Get-Curva ([DateTime]::Now - $segT0).TotalSeconds $est))
+            if ($v -gt $mostrado) { $mostrado = $v; Set-Progresso $mostrado $script:Rotulo }
+        }
+        if (-not $fim) { Start-Sleep -Milliseconds 100 }
     }
+    Write-Log ('BARRA_TESTE teste={0} total_ms={1} barra_final={2}%' -f $modo, [int]([DateTime]::Now - $t0).TotalMilliseconds, $mostrado)
     $script:ProcTeste = $null
     if ($res.Codigo -eq -1) {
         $res.Codigo = 90
@@ -2443,7 +2596,8 @@ function Expand-PacoteGsurf {
     Write-Linhas '> Baixando os instaladores da GSurf...' 'Cyan'
     try {
         try { [Net.ServicePointManager]::SecurityProtocol = 3072 } catch { }
-        (New-Object Net.WebClient).DownloadFile($GSURF_PACOTE_URL, $pac)
+        # Em paralelo, para a barra andar durante o download.
+        [void](Invoke-ComBarra { param($u, $f) (New-Object Net.WebClient).DownloadFile($u, $f) } @($GSURF_PACOTE_URL, $pac) 600000 20 'gsurf_download')
     } catch {
         throw ('Não foi possível baixar os instaladores da GSurf: {0} | Confira a internet do PDV (acesso a raw.githubusercontent.com).' -f (Get-MsgErro $_))
     }
@@ -2460,7 +2614,7 @@ function Expand-PacoteGsurf {
         Write-Linhas ('> Extraindo para ' + $GSURF_RAIZ + '...') 'Cyan'
         $p = Start-Process -FilePath $pac -ArgumentList ('-s -o+ "-d{0}"' -f $GSURF_RAIZ) -PassThru
         $null = $p.Handle
-        [void](Wait-Processo $p 0 15)
+        [void](Wait-Processo $p 0 15 'gsurf_extracao')
     } finally { $fs.Close() }
     Write-Log ('GSURF_PACOTE_RC={0}' -f $p.ExitCode)
     if (-not (Test-Path -LiteralPath $GSURF_DIR)) { throw ('A extração não criou ' + $GSURF_DIR + '.') }
@@ -2512,7 +2666,7 @@ function Test-RequisitosGsurf {
     $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Requisitos "{1}"' -f (Get-ScriptFilho), $exe
     $p = Start-Process -FilePath $psExe -ArgumentList $a -WindowStyle Hidden -PassThru
     $null = $p.Handle
-    if (-not (Wait-Processo $p 180000 25)) {
+    if (-not (Wait-Processo $p 180000 25 'gsurf_requisitos')) {
         try { $p.Kill() } catch { }
         Get-Process -Name 'RequisitosGSurf' -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch { } }
         Write-Log 'REQUISITOS: tempo esgotado (180 s)'
@@ -2650,7 +2804,7 @@ function Install-ServicoGsurf {
         # msiexec pelo caminho do sistema (API), não por %windir%.
         $p = Start-Process -FilePath (Join-Path ([Environment]::SystemDirectory) 'msiexec.exe') -ArgumentList $a -PassThru
         $null = $p.Handle
-        [void](Wait-Processo $p 0 20)
+        [void](Wait-Processo $p 0 20 'gsurf_msi')
     } finally { Close-Travados $travados }
     Write-Log ('MSIEXEC_RC={0}' -f $p.ExitCode)
     if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
@@ -2885,7 +3039,7 @@ function Install-CertificadoGsurfAuto([string]$login, [string]$senha, [string]$o
         $a = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Certificado "{1}" -CredArq "{2}" -Status "{3}"' -f (Get-ScriptFilho), $exe, $arq, $st
         $p = Start-Process -FilePath $psExe -ArgumentList $a -WindowStyle Hidden -PassThru
         $null = $p.Handle
-        if (Wait-Processo $p 200000 30) { $rc = $p.ExitCode } else { try { $p.Kill() } catch { }; $rc = 98 }
+        if (Wait-Processo $p 200000 30 'gsurf_certificado') { $rc = $p.ExitCode } else { try { $p.Kill() } catch { }; $rc = 98 }
     } finally {
         Close-Travados $travados
         if ([IO.File]::Exists($arq)) { [IO.File]::Delete($arq) }
@@ -2935,6 +3089,8 @@ function Start-Fase([string]$nome) {
     $script:UltPctTela = -1
     $script:BarraNaTela = $false
     $script:PctAte = 0
+    Reset-MedicaoBarra
+    Write-Log ('BARRA_FASE_INICIO {0}' -f $nome)
     Write-Host ''
     Write-Host ('  ' + $nome) -ForegroundColor White
 }
@@ -2979,13 +3135,13 @@ function Invoke-Automatico {
         Save-EstadoOriginal
         $script:TokenTls = $tok
         Write-TokenMysql
-        Set-Progresso 12 'Criando o CONFITLS.INI'
+        Set-Progresso 8 'Criando o CONFITLS.INI'
         Write-ConfiTls
         Confirm-Gravacoes
         Remove-ControleTls
         $script:RollbackOn = $false
         $script:Rotulo = 'Testando a comunicação'
-        $r = Invoke-TesteSiTef 'TLS' 20 98
+        $r = Invoke-TesteSiTef 'TLS' 10 98
         if ($r.Codigo -eq 0) { $tlsOk = $true }
         else {
             $m = $r.Msg; if (-not $m) { $m = $r.Util }; if (-not $m) { $m = 'Sem retorno' }
@@ -3005,22 +3161,22 @@ function Invoke-Automatico {
         Start-Fase 'GSurf'
         try {
             Set-Progresso 3 'Preparando os arquivos'
-            $script:PctAte = 10
+            $script:PctAte = 5
             if (-not (Test-Path -LiteralPath $GSURF_DIR)) { Expand-PacoteGsurf }
-            Set-Progresso 10 'Verificando os requisitos (até 1 minuto)'
-            $script:PctAte = 40
+            Set-Progresso 5 'Verificando os requisitos (até 1 minuto)'
+            $script:PctAte = 33
             $script:ReqFalha = ''
             if (-not (Test-RequisitosGsurf)) { throw ('requisitos | ' + $script:ReqFalha) }
-            Set-Progresso 40 'Instalando o serviço'
-            $script:PctAte = 55
+            Set-Progresso 33 'Instalando o serviço'
+            $script:PctAte = 43
             Install-ServicoGsurf
             Clear-Barra
             # Enter apertado antes (tela que parecia parada) não vira OTP vazio.
             try { $Host.UI.RawUI.FlushInputBuffer() } catch { }
             $otp = ''
             while (-not $otp) { $otp = ([string](Read-Campo 'OTP GSurf:')).Trim() }
-            Set-Progresso 55 'Instalando o certificado'
-            $script:PctAte = 75
+            Set-Progresso 43 'Instalando o certificado'
+            $script:PctAte = 62
             $c = Install-CertificadoGsurfAuto $credAberta.Login $credAberta.Senha $otp
             $otp = $null
             if ($c.Rc -ne 0 -and $c.Tela -notmatch '(?i)sucesso') {
@@ -3039,23 +3195,27 @@ function Invoke-Automatico {
         $script:PctAte = 0
         if ($gsurfOk) {
             try {
-                Set-Progresso 78 'Mudando para GSurf'
+                Set-Progresso 62 'Mudando para GSurf'
                 Switch-Gsurf
                 # Certificado recém-instalado: o serviço GSurf relê o certificado ao
                 # reiniciar, e a conexão leva alguns segundos para subir. Testar na
                 # hora dava falha, e o teste pelo menu minutos depois passava.
-                Set-Progresso 80 'Reiniciando o serviço GSurf'
+                Set-Progresso 63 'Reiniciando o serviço GSurf'
                 $svc = Get-ServicoGsurf
-                if ($svc) { try { Restart-Service -Name $svc.Name -Force -ErrorAction Stop } catch { Write-Log ('WARN: restart {0}: {1}' -f $svc.Name, (Get-MsgErro $_)) } }
-                $faixas = @(@(82, 89), @(90, 94), @(95, 98))
+                if ($svc) {
+                    $script:PctAte = 68
+                    try { [void](Invoke-ComBarra { param($n) Restart-Service -Name $n -Force -ErrorAction Stop } @($svc.Name) 120000 5 'gsurf_reinicio') }
+                    catch { Write-Log ('WARN: restart {0}: {1}' -f $svc.Name, (Get-MsgErro $_)) }
+                }
+                $faixas = @(@(68, 92), @(93, 95), @(96, 98))
                 for ($t = 1; $t -le 3; $t++) {
                     if ($t -gt 1) {
                         Write-Log ('GSURF_RETESTE: tentativa {0}/3 (falha anterior: {1})' -f $t, $r.Util)
+                        # Espera de 15 s andando a barra até o começo da próxima tentativa.
+                        $script:PctAte = $faixas[$t - 1][0]
+                        Set-Progresso $script:UltPctTela ('Aguardando a GSurf conectar (tentativa {0} de 3)' -f $t)
                         $fimEspera = [DateTime]::Now.AddSeconds(15)
-                        while ([DateTime]::Now -lt $fimEspera) {
-                            Set-Progresso $faixas[$t - 1][0] ('Aguardando a GSurf conectar (tentativa {0} de 3)' -f $t)
-                            Start-Sleep -Milliseconds 500
-                        }
+                        [void](Wait-ComBarra ({ Start-Sleep -Milliseconds 100; [DateTime]::Now -ge $fimEspera }.GetNewClosure()) 0 15 '')
                     }
                     $script:Rotulo = 'Testando a comunicação'
                     if ($t -gt 1) { $script:Rotulo = 'Testando a comunicação (tentativa {0} de 3)' -f $t }
